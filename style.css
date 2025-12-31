@@ -1,0 +1,122 @@
+/* ---- Dashboard Modal ---- */
+#ccModalOverlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  background: rgba(0,0,0,.55);
+  display: none;
+}
+
+#ccModalOverlay[data-open="1"] { display: block; }
+
+#ccModal {
+  position: absolute;
+  left: 50%;
+  top: 14%;
+  transform: translateX(-50%);
+  width: min(380px, calc(100vw - 24px));
+  background: rgba(20,20,20,.92);
+  color: #fff;
+  border: 1px solid rgba(255,255,255,.18);
+  border-radius: 16px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.45);
+  overflow: hidden;
+  backdrop-filter: blur(8px);
+}
+
+#ccModal header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 12px 10px;
+  border-bottom: 1px solid rgba(255,255,255,.12);
+}
+
+#ccModal header .title { font-weight: 800; font-size: 14px; }
+
+#ccModal header .xbtn {
+  all: unset;
+  cursor: pointer;
+  padding: 6px 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(255,255,255,.14);
+}
+
+#ccModal .body { padding: 12px; display: grid; gap: 10px; }
+
+.ccCards { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+
+.ccCard {
+  border: 1px solid rgba(255,255,255,.12);
+  border-radius: 14px;
+  padding: 10px;
+  background: rgba(255,255,255,.04);
+}
+
+.ccLabel { font-size: 12px; opacity: .75; margin-bottom: 6px; }
+.ccValue { font-size: 22px; font-weight: 900; letter-spacing: .2px; }
+.ccSmall { font-size: 12px; opacity: .7; margin-top: 6px; }
+
+#ccBars {
+  border: 1px solid rgba(255,255,255,.12);
+  border-radius: 14px;
+  padding: 10px;
+  background: rgba(255,255,255,.04);
+}
+
+#ccBars .barsTitle {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 8px;
+}
+
+#ccBars .barsTitle .left { font-size: 12px; opacity: .85; }
+#ccBars .barsTitle .right { font-size: 11px; opacity: .6; }
+
+.ccBarRow {
+  display: grid;
+  grid-template-columns: 56px 1fr 34px;
+  gap: 8px;
+  align-items: center;
+  margin: 6px 0;
+}
+
+.ccBarDate { font-size: 11px; opacity: .78; }
+.ccBarTrack {
+  height: 10px;
+  border-radius: 999px;
+  background: rgba(255,255,255,.10);
+  overflow: hidden;
+}
+.ccBarFill {
+  height: 100%;
+  width: 0%;
+  background: rgba(255,255,255,.78);
+  border-radius: 999px;
+}
+.ccBarNum { text-align: right; font-size: 11px; opacity: .88; }
+
+#ccModal footer {
+  display: flex;
+  gap: 8px;
+  padding: 12px;
+  border-top: 1px solid rgba(255,255,255,.12);
+}
+
+.ccBtn {
+  all: unset;
+  cursor: pointer;
+  flex: 1;
+  text-align: center;
+  padding: 10px;
+  border-radius: 12px;
+  border: 1px solid rgba(255,255,255,.14);
+  background: rgba(255,255,255,.04);
+  font-size: 13px;
+}
+
+.ccBtn.danger {
+  border-color: rgba(255,120,120,.35);
+  background: rgba(255,120,120,.12);
+}
