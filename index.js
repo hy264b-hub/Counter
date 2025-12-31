@@ -5,27 +5,103 @@
 
   const getCtx = () => SillyTavern.getContext();
 
-  // --- Copilot(4141) 판별: Custom Endpoint 입력값에서 확인 ---
-  // 너가 말한 값: http://localhost:4141/v1
-  function isCopilot4141Selected() {
-    const needles = ["localhost:4141", "127.0.0.1:4141", "0.0.0.0:4141"];
+  // =========================
+  // 1) Copilot(4141) 판별 (절대 안 죽는 버전)
+  // - DOM input이 없어도 OK
+  // - getContext 어디에 숨어 있어도 OK (얕은 탐색)
+  // - localStorage에 저장돼 있어도 OK
+  // =========================
+  const COPILOT_NEEDLES = ["localhost:4141", "127.0.0.1:4141", "0.0.0.0:4141", ":4141/v1", ":4141"];
 
-    // input 요소들 중에 4141이 들어간 값이 있으면 Copilot로 간주
-    const inputs = Array.from(document.querySelectorAll("input"));
-    for (const el of inputs) {
-      const v = (el?.value ?? "").toString().toLowerCase();
-      if (!v) continue;
-      if (needles.some(n => v.includes(n))) return true;
-    }
-
-    // 보험: 화면 텍스트에 4141이 박혀있는 경우 (일부 UI가 span으로 보여줄 수 있음)
-    const bodyText = (document.body?.innerText ?? "").toLowerCase();
-    if (needles.some(n => bodyText.includes(n))) return true;
-
-    return false;
+  function includes4141(s) {
+    if (typeof s !== "string") return false;
+    const v = s.toLowerCase();
+    return COPILOT_NEEDLES.some(n => v.includes(n));
   }
 
-  // KST/로컬 기준 "오늘"
+  function searchObjectForNeedle(obj, maxDepth = 4) {
+    // { found: boolean, path: string, value: string }
+    const seen = new Set();
+
+    function walk(node, path, depth) {
+      if (depth > maxDepth) return null;
+      if (!node || typeof node !== "object") return null;
+      if (seen.has(node)) return null;
+      seen.add(node);
+
+      // 문자열 직접 체크
+      if (typeof node === "string") {
+        if (includes4141(node)) return { found: true, path, value: node };
+        return null;
+      }
+
+      // 배열/객체 순회
+      const entries = Array.isArray(node)
+        ? node.map((v, i) => [String(i), v])
+        : Object.entries(node);
+
+      for (const [k, v] of entries) {
+        if (typeof v === "string" && includes4141(v)) {
+          return { found: true, path: path ? `${path}.${k}` : k, value: v };
+        }
+        if (v && typeof v === "object") {
+          const res = walk(v, path ? `${path}.${k}` : k, depth + 1);
+          if (res) return res;
+        }
+      }
+      return null;
+    }
+
+    return walk(obj, "", 0);
+  }
+
+  function searchLocalStorageForNeedle() {
+    try {
+      // 너무 많이 돌면 느려질 수 있어서 제한
+      const keys = Object.keys(localStorage || {}).slice(0, 50);
+      for (const k of keys) {
+        const raw = localStorage.getItem(k);
+        if (!raw) continue;
+        if (includes4141(raw)) return { found: true, key: k, value: raw.slice(0, 200) };
+
+        // JSON이면 파싱해서 더 정확히
+        if (raw.startsWith("{") || raw.startsWith("[")) {
+          try {
+            const obj = JSON.parse(raw);
+            const res = searchObjectForNeedle(obj, 4);
+            if (res?.found) return { found: true, key: k, path: res.path, value: res.value };
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  function detectCopilot4141() {
+    // 1) Context에서 찾기 (설정 패널 열려있지 않아도 가능)
+    const c = getCtx();
+    const resCtx = searchObjectForNeedle(c, 4);
+    if (resCtx?.found) return { ok: true, where: `context:${resCtx.path}`, value: resCtx.value };
+
+    // 2) DOM input에서 찾기 (설정 패널 열려있을 때)
+    try {
+      const inputs = Array.from(document.querySelectorAll("input"));
+      for (const el of inputs) {
+        const v = (el?.value ?? "").toString();
+        if (includes4141(v)) return { ok: true, where: "dom:input", value: v };
+      }
+    } catch (_) {}
+
+    // 3) localStorage에서 찾기
+    const resLS = searchLocalStorageForNeedle();
+    if (resLS?.found) return { ok: true, where: `localStorage:${resLS.key}${resLS.path ? ":" + resLS.path : ""}`, value: resLS.value };
+
+    return { ok: false, where: "not-found", value: "" };
+  }
+
+  // =========================
+  // 2) 날짜/저장
+  // =========================
   function todayKeyLocal() {
     const d = new Date();
     const y = d.getFullYear();
@@ -40,13 +116,18 @@
       extensionSettings[MODULE] = {
         total: 0,
         byDay: {},
-        lastSig: "" // 중복 방지
+        lastSig: "",
+        debug: {
+          lastEvent: "",
+          lastCopilotDetect: "",
+        }
       };
     }
     const s = extensionSettings[MODULE];
     if (!s.byDay) s.byDay = {};
     if (typeof s.total !== "number") s.total = 0;
     if (typeof s.lastSig !== "string") s.lastSig = "";
+    if (!s.debug) s.debug = { lastEvent: "", lastCopilotDetect: "" };
     return s;
   }
 
@@ -54,7 +135,9 @@
     getCtx().saveSettingsDebounced();
   }
 
-  // 메시지 텍스트 후보 넓게
+  // =========================
+  // 3) 메시지 파싱/유효성
+  // =========================
   function getMsgText(msg) {
     if (!msg) return "";
     const candidates = [
@@ -80,7 +163,19 @@
     return false;
   }
 
-  // --- Dashboard UI ---
+  function signatureFromMessage(msg) {
+    const text = getMsgText(msg).trim();
+    const time =
+      (typeof msg?.send_date === "number" ? String(msg.send_date) : "") ||
+      (typeof msg?.created === "number" ? String(msg.created) : "") ||
+      (typeof msg?.id === "string" ? msg.id : "");
+    const head = text.slice(0, 80);
+    return `${time}|${head}`;
+  }
+
+  // =========================
+  // 4) UI (대시보드)
+  // =========================
   function lastNDaysKeysLocal(n = 7) {
     const out = [];
     const base = new Date();
@@ -129,6 +224,12 @@
             </div>
             <div id="ccBarsList"></div>
           </div>
+
+          <!-- 디버그: 폰이라 콘솔 못 볼 때 여기서 확인 -->
+          <div class="ccCard" style="padding:10px;border-radius:14px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04)">
+            <div class="ccLabel">상태</div>
+            <div class="ccSmall" id="ccDebugLine">—</div>
+          </div>
         </div>
 
         <footer>
@@ -143,7 +244,6 @@
     });
 
     document.body.appendChild(overlay);
-
     document.getElementById("ccCloseBtn").addEventListener("click", closeDashboard);
     document.getElementById("ccCloseBtn2").addEventListener("click", closeDashboard);
 
@@ -153,6 +253,7 @@
       s.total = 0;
       s.byDay = {};
       s.lastSig = "";
+      s.debug = { lastEvent: "", lastCopilotDetect: "" };
       save();
       renderDashboard();
     });
@@ -197,9 +298,16 @@
     });
 
     document.getElementById("ccBarsHint").textContent = `max ${max}`;
+
+    const dbg = document.getElementById("ccDebugLine");
+    if (dbg) {
+      dbg.textContent = `event=${s.debug?.lastEvent || "-"} / copilot=${s.debug?.lastCopilotDetect || "-"}`;
+    }
   }
 
-  // --- 🪄 메뉴 주입 ---
+  // =========================
+  // 5) 메뉴 주입
+  // =========================
   function findWandMenuContainer() {
     const candidates = [
       "#extensions_menu",
@@ -249,7 +357,12 @@
     mo.observe(document.body, { childList: true, subtree: true });
   }
 
-  // --- ✅ 카운트 ---
+  // =========================
+  // 6) 집계: 여러 이벤트를 동시에 구독해서 "절대 안 죽게"
+  // - 어떤 환경은 MESSAGE_RECEIVED만 뜨고
+  // - 어떤 환경은 GENERATION_ENDED만 뜨고
+  // - 어떤 환경은 CHARACTER_MESSAGE_RENDERED만 뜸
+  // =========================
   function increment() {
     const s = getSettings();
     const t = todayKeyLocal();
@@ -261,12 +374,15 @@
     if (overlay?.getAttribute("data-open") === "1") renderDashboard();
   }
 
-  // ✅ 가장 안정: MESSAGE_RECEIVED에서 assistant 메시지를 카운트
-  function onMessageReceived(data) {
-    // Copilot 선택 상태가 아닐 때는 집계 안 함
-    if (!isCopilot4141Selected()) return;
+  function tryCountFromMessage(msg, eventName) {
+    const s = getSettings();
+    s.debug.lastEvent = eventName || "";
+    const det = detectCopilot4141();
+    s.debug.lastCopilotDetect = det.ok ? `YES (${det.where})` : `NO (${det.where})`;
+    save();
 
-    const msg = data?.message ?? data?.msg ?? data;
+    // Copilot(4141) 아닐 때는 카운트 안 함
+    if (!det.ok) return;
 
     const isAssistant =
       (msg?.is_user === false) ||
@@ -279,17 +395,44 @@
     const text = getMsgText(msg);
     if (text.trim().length === 0) return;
 
-    // 중복 방지 시그니처
-    const sig =
-      (typeof msg?.send_date === "number" ? String(msg.send_date) : "") ||
-      (typeof msg?.id === "string" ? msg.id : "") ||
-      (text.trim().slice(0, 80));
+    const sig = signatureFromMessage(msg);
+    if (!sig || sig === "none|") return;
 
-    const s = getSettings();
     if (s.lastSig === sig) return;
     s.lastSig = sig;
 
     increment();
+  }
+
+  function onMessageReceived(data) {
+    const msg = data?.message ?? data?.msg ?? data;
+    tryCountFromMessage(msg, "MESSAGE_RECEIVED");
+  }
+
+  function onCharacterRendered() {
+    // context.chat에서 마지막 assistant를 뽑는 방식 (payload가 없을 때)
+    const c = getCtx();
+    const chat = c.chat ?? [];
+    for (let i = chat.length - 1; i >= 0; i--) {
+      const m = chat[i];
+      if (m?.is_user === false || m?.role === "assistant") {
+        tryCountFromMessage(m, "CHARACTER_MESSAGE_RENDERED");
+        return;
+      }
+    }
+  }
+
+  function onGenEnded(payload) {
+    // generation 종료 시점에 마지막 assistant를 채팅에서 뽑아 카운트
+    const c = getCtx();
+    const chat = c.chat ?? [];
+    for (let i = chat.length - 1; i >= 0; i--) {
+      const m = chat[i];
+      if (m?.is_user === false || m?.role === "assistant") {
+        tryCountFromMessage(m, "GENERATION_ENDED");
+        return;
+      }
+    }
   }
 
   function main() {
@@ -299,19 +442,10 @@
 
     const { eventSource, event_types } = getCtx();
 
-    // ✅ 핵심: MESSAGE_RECEIVED
-    if (event_types.MESSAGE_RECEIVED) {
-      eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
-    } else {
-      // staging에서 이름이 다를 수도 있어서, 가능한 후보를 몇 개 더 시도
-      const fallbackNames = ["MESSAGE_RECEIVED", "message_received", "MESSAGE_RECEIVE"];
-      for (const name of fallbackNames) {
-        if (event_types[name]) {
-          eventSource.on(event_types[name], onMessageReceived);
-          break;
-        }
-      }
-    }
+    // 다 잡아둠 (안 뜨는 건 무시됨)
+    if (event_types?.MESSAGE_RECEIVED) eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
+    if (event_types?.CHARACTER_MESSAGE_RENDERED) eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, onCharacterRendered);
+    if (event_types?.GENERATION_ENDED) eventSource.on(event_types.GENERATION_ENDED, onGenEnded);
   }
 
   main();
