@@ -6,6 +6,101 @@
   const getCtx = () => SillyTavern.getContext();
 
   // =========================
+// 요청 단에서 "이번 생성이 Copilot인지" 태깅하기
+// - ST UI -> ST 서버로 보내는 fetch의 body에 source 정보가 들어있음
+// =========================
+let lastRequestTag = "";     // "copilot" | "google" | "other"
+let lastRequestAt = 0;
+const TAG_WINDOW_MS = 2 * 60 * 1000; // 2분 안에 들어온 응답만 해당 요청으로 간주
+
+function tagFromBodyText(t) {
+  const s = (t || "").toLowerCase();
+
+  // Google 쪽 키워드
+  if (s.includes("google") || s.includes("gemini") || s.includes("ai studio")) return "google";
+
+  // OpenAI-compatible 쪽 키워드(너는 Copilot을 여기로 쓰고 있음)
+  if (
+    s.includes("openai") ||
+    s.includes("openai-compatible") ||
+    s.includes("openai compatible") ||
+    s.includes("chat completion") ||
+    s.includes("chat_completion_source")
+  ) {
+    // 여기서 4141도 같이 확인하면 더 안전
+    if (s.includes("localhost:4141") || s.includes("127.0.0.1:4141") || s.includes("0.0.0.0:4141") || s.includes(":4141")) {
+      return "copilot";
+    }
+    return "other";
+  }
+
+  // 4141이 직접 들어간 바디면 Copilot로 치기
+  if (s.includes("localhost:4141") || s.includes("127.0.0.1:4141") || s.includes("0.0.0.0:4141") || s.includes(":4141")) {
+    return "copilot";
+  }
+
+  return "";
+}
+
+(function hookFetchForTagging() {
+  if (window.__ccTaggedFetchHooked) return;
+  window.__ccTaggedFetchHooked = true;
+
+  const origFetch = window.fetch.bind(window);
+
+  window.fetch = async (...args) => {
+    try {
+      const input = args[0];
+      const init = args[1] || {};
+      const url =
+        (typeof input === "string" && input) ||
+        (input && typeof input.url === "string" && input.url) ||
+        "";
+
+      // ST 내부 API로 보내는 요청에 body가 실리는 경우가 많음
+      const body = init?.body;
+
+      // body가 string이면 바로, 아니면 무시(스트림/바이너리 등)
+      if (typeof body === "string") {
+        const tag = tagFromBodyText(body);
+        if (tag) {
+          lastRequestTag = tag;
+          lastRequestAt = Date.now();
+        }
+      } else if (body && typeof body === "object" && !(body instanceof FormData)) {
+        // 가끔 object로 들어오는 케이스 방어 (대부분은 string이지만)
+        try {
+          const txt = JSON.stringify(body);
+          const tag = tagFromBodyText(txt);
+          if (tag) {
+            lastRequestTag = tag;
+            lastRequestAt = Date.now();
+          }
+        } catch (_) {}
+      }
+
+      // (보험) url 자체에 단서가 있는 경우도 있을 수 있어 저장
+      if (typeof url === "string" && url) {
+        const tag = tagFromBodyText(url);
+        if (tag) {
+          lastRequestTag = tag;
+          lastRequestAt = Date.now();
+        }
+      }
+    } catch (_) {}
+
+    return origFetch(...args);
+  };
+})();
+
+function isRecentCopilotRequest() {
+  if (!lastRequestTag) return false;
+  if ((Date.now() - lastRequestAt) > TAG_WINDOW_MS) return false;
+  return lastRequestTag === "copilot";
+}
+
+
+  // =========================
   // 1) Copilot(4141) 판별 (절대 안 죽는 버전)
   // - DOM input이 없어도 OK
   // - getContext 어디에 숨어 있어도 OK (얕은 탐색)
@@ -448,8 +543,9 @@ function isCopilotSourceSelected() {
     s.debug.lastCopilotDetect = det.ok ? `YES (${det.where})` : `NO (${det.where})`;
     save();
 
-    // Copilot(4141) 아닐 때는 카운트 안 함
-    if (!det.ok) return;
+    // ✅ "이번 응답이 Copilot 요청의 결과"일 때만 카운트
+// (Google로 요청했으면 lastRequestTag가 google로 찍혀서 걸러짐)
+if (!isRecentCopilotRequest()) return;
 
     if (!isCopilotSourceSelected()) return;
 
