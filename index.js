@@ -5,6 +5,31 @@
 
   const getCtx = () => SillyTavern.getContext();
 
+  // ✅ Copilot(localhost:4141)일 때만 집계
+function isCopilot4141() {
+  const c = getCtx();
+
+  const candidates = [
+    c?.settings?.api_url,
+    c?.settings?.apiUrl,
+    c?.api_url,
+    c?.apiUrl,
+    c?.oai_settings?.api_url,
+    c?.oai_settings?.apiUrl,
+    c?.openai_settings?.api_url,
+    c?.openai_settings?.apiUrl
+  ];
+
+  const base = (candidates.find(v => typeof v === "string") || "").toLowerCase();
+
+  return (
+    base.includes("localhost:4141") ||
+    base.includes("127.0.0.1:4141") ||
+    base.includes("0.0.0.0:4141")
+  );
+}
+
+
   // KST/로컬 기준 "오늘"
   function todayKeyLocal() {
     const d = new Date();
@@ -321,6 +346,9 @@
 
     s.lastCountedSig[key] = endSig;
     s.inFlight = null;
+    // ✅ Copilot(4141)일 때만 카운트
+    if (!isCopilot4141()) return;
+    
     increment();
   }
 
