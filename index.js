@@ -5,15 +5,53 @@
   const getCtx = () => SillyTavern.getContext();
 
   // =========================
-  // 로그/상태
+  // 유틸
   // =========================
-  const logs = [];
-  const MAX_LOGS = 80;
+  const NEEDLE_4141 = /localhost:4141|127\.0\.0\.1:4141|0\.0\.0\.0:4141|:4141\b|:4141\/v1/i;
 
-  function nowStr() {
-    return new Date().toLocaleTimeString("ko-KR");
+  function nowStr() { return new Date().toLocaleTimeString("ko-KR"); }
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, m => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    }[m]));
   }
 
+  // =========================
+  // 저장값 (LOCK 모드)
+  // =========================
+  // lockMode:
+  //  - "auto": 4141 감지될 때만 집계
+  //  - "on"  : 무조건 집계
+  //  - "off" : 무조건 집계 안 함
+  function getSettings() {
+    const { extensionSettings } = getCtx();
+    if (!extensionSettings[MODULE]) {
+      extensionSettings[MODULE] = {
+        total: 0,
+        byDay: {},
+        lastSig: "",
+        lockMode: "auto",
+      };
+    }
+    const s = extensionSettings[MODULE];
+    if (!s.byDay) s.byDay = {};
+    if (typeof s.total !== "number") s.total = 0;
+    if (typeof s.lastSig !== "string") s.lastSig = "";
+    if (!["auto","on","off"].includes(s.lockMode)) s.lockMode = "auto";
+    return s;
+  }
+  function save() { getCtx().saveSettingsDebounced(); }
+
+  function todayKeyLocal() {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+  }
+
+  // =========================
+  // 로그
+  // =========================
+  const logs = [];
+  const MAX_LOGS = 150;
   function addLog(msg) {
     logs.unshift(`[${nowStr()}] ${msg}`);
     if (logs.length > MAX_LOGS) logs.pop();
@@ -21,184 +59,100 @@
     if (el) el.innerHTML = logs.map(l => `<div>${escapeHtml(l)}</div>`).join("");
   }
 
-  function escapeHtml(s) {
-    return String(s).replace(/[&<>"']/g, m => ({
-      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
-    }[m]));
-  }
-
-  function safeJsonParse(text) {
-    try { return JSON.parse(text); } catch { return null; }
-  }
-
   // =========================
-  // "실제 요청" 기반 라우트 태깅 (핵심)
-  // - 설정/DOM은 신뢰하지 않는다(Blob/cached issue)
-  // - ST 서버로 나가는 요청 body 안에 source / api_url / endpoint / provider 등이 들어있는 경우가 많음
+  // Copilot 토큰 큐 (덮어쓰기 방지)
   // =========================
-  const ROUTE_WINDOW_MS = 2 * 60 * 1000; // 2분: 요청-응답 매칭 윈도우
-  let lastRoute = {
-    at: 0,
-    kind: "unknown", // "copilot" | "google" | "other" | "unknown"
-    why: "",
-    model: "",
-    url: "",
-  };
+  const COPILOT_QUEUE_MS = 2 * 60 * 1000;
+  const copilotQueue = []; // [{at, why, url}]
 
-  const NEEDLE_4141 = /localhost:4141|127\.0\.0\.1:4141|0\.0\.0\.0:4141|:4141\b|:4141\/v1/i;
-  const NEEDLE_GOOGLE = /generativelanguage\.googleapis\.com|ai\.google\.dev|aistudio|ai studio|gemini|google/i;
-
-  // "Google 직결"로 강하게 판단할 만한 키들(오탐 방지)
-  const STRONG_GOOGLE = /generativelanguage\.googleapis\.com/i;
-
-  function extractModel(obj) {
-    if (!obj || typeof obj !== "object") return "";
-    // 흔한 모델 필드들
-    const candidates = [
-      obj.model,
-      obj?.data?.model,
-      obj?.payload?.model,
-      obj?.request?.model,
-      obj?.parameters?.model,
-      obj?.body?.model,
-    ];
-    const v = candidates.find(x => typeof x === "string" && x.trim());
-    return v ? v.trim() : "";
-  }
-
-  function classifyRouteFromText(url, bodyText) {
-    const u = (url || "").toString();
-    const b = (bodyText || "").toString();
-    const combined = `${u}\n${b}`;
-
-    // 1) Google 직결(가장 확실): Google API 도메인
-    if (STRONG_GOOGLE.test(combined)) {
-      return { kind: "google", why: "strong_google_domain" };
+  function pruneQueue() {
+    const now = Date.now();
+    while (copilotQueue.length && (now - copilotQueue[copilotQueue.length - 1].at) > COPILOT_QUEUE_MS) {
+      copilotQueue.pop();
     }
-
-    // 2) 4141이 body/url 어딘가에 있으면 Copilot 라우팅
-    if (NEEDLE_4141.test(combined)) {
-      return { kind: "copilot", why: "needle_4141_in_url_or_body" };
-    }
-
-    // 3) google/gemini 단서가 있는데 4141은 없으면 google로 분류(약한 신호)
-    if (NEEDLE_GOOGLE.test(combined) && !NEEDLE_4141.test(combined)) {
-      return { kind: "google", why: "googleish_keywords_no_4141" };
-    }
-
-    // 4) 그 외
-    return { kind: "other", why: "no_4141_no_google_domain" };
   }
 
-  function tagRoute({ kind, why, model, url }) {
-    lastRoute = {
-      at: Date.now(),
-      kind,
-      why,
-      model: model || "",
-      url: url || "",
-    };
-    addLog(`🏷️ route=${kind} (${why})${model ? ` / model=${model}` : ""}`);
+  function pushCopilotToken(why, url) {
+    copilotQueue.unshift({ at: Date.now(), why, url: url || "" });
+    pruneQueue();
+    addLog(`🏷️ copilot token +1 (${why}) queue=${copilotQueue.length}`);
   }
 
-  function isRecentCopilotRoute() {
-    if (lastRoute.kind !== "copilot") return false;
-    return (Date.now() - lastRoute.at) < ROUTE_WINDOW_MS;
+  function consumeCopilotToken() {
+    pruneQueue();
+    if (!copilotQueue.length) return null;
+    return copilotQueue.shift();
   }
 
   // =========================
-  // fetch 후킹 (Request 객체도 처리)
+  // fetch/XHR 후킹: "4141 감지"만으로 토큰 생성
   // =========================
+  function looksGen(url, bodyText) {
+    return /chat|completion|messages|generate/i.test(url || "") ||
+           /"messages"\s*:|"prompt"\s*:|"model"\s*:/.test(bodyText || "");
+  }
+
   (function hookFetch() {
-    if (window.__ccFetchHooked_final) return;
-    window.__ccFetchHooked_final = true;
+    if (window.__ccFetchHooked_toggle) return;
+    window.__ccFetchHooked_toggle = true;
 
     const origFetch = window.fetch.bind(window);
-
     window.fetch = async (...args) => {
       try {
         const input = args[0];
         const init = args[1] || {};
 
-        // URL 추출
         let url = "";
         if (typeof input === "string") url = input;
         else if (input && typeof input.url === "string") url = input.url;
 
-        // body 텍스트 추출
         let bodyText = "";
-        // 1) init.body 우선
-        if (init && init.body != null) {
-          if (typeof init.body === "string") {
-            bodyText = init.body;
-          } else if (init.body && typeof init.body === "object" && !(init.body instanceof FormData)) {
+        if (init?.body != null) {
+          if (typeof init.body === "string") bodyText = init.body;
+          else if (typeof init.body === "object" && !(init.body instanceof FormData)) {
             try { bodyText = JSON.stringify(init.body); } catch {}
           }
         }
-
-        // 2) input이 Request면 clone해서 text 시도 (가능한 경우)
         if (!bodyText && input instanceof Request) {
           try {
-            const cloned = input.clone();
-            const t = await cloned.text();
+            const t = await input.clone().text();
             if (t && t.trim()) bodyText = t;
           } catch {}
         }
 
-        // "채팅 생성"으로 보이는 요청만 태깅(너무 많은 요청 오염 방지)
-        const looksGen =
-          /generate|completion|chat|messages|api\/|backend|openai|gemini|anthropic/i.test(url) ||
-          /"messages"\s*:|"prompt"\s*:|"model"\s*:/.test(bodyText);
-
-        if (looksGen && (url || bodyText)) {
-          const parsed = safeJsonParse(bodyText);
-          const model = extractModel(parsed) || "";
-          const { kind, why } = classifyRouteFromText(url, bodyText);
-          tagRoute({ kind, why, model, url });
+        if (looksGen(url, bodyText) && NEEDLE_4141.test(`${url}\n${bodyText}`)) {
+          pushCopilotToken("needle_4141_in_url_or_body", url);
         }
-      } catch (e) {
-        // 후킹에서 죽으면 전체가 망함 → 절대 throw 금지
-      }
+      } catch {}
       return origFetch(...args);
     };
 
     addLog("✅ fetch hook ON");
   })();
 
-  // =========================
-  // XHR 후킹 (ST가 XHR 쓰는 환경 대비)
-  // =========================
   (function hookXHR() {
-    if (window.__ccXHRHooked_final) return;
-    window.__ccXHRHooked_final = true;
+    if (window.__ccXHRHooked_toggle) return;
+    window.__ccXHRHooked_toggle = true;
 
     const origOpen = XMLHttpRequest.prototype.open;
     const origSend = XMLHttpRequest.prototype.send;
 
-    XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+    XMLHttpRequest.prototype.open = function(method, url, ...rest) {
       this.__ccUrl = url || "";
       return origOpen.call(this, method, url, ...rest);
     };
 
-    XMLHttpRequest.prototype.send = function (body) {
+    XMLHttpRequest.prototype.send = function(body) {
       try {
         const url = this.__ccUrl || "";
         let bodyText = "";
-
         if (typeof body === "string") bodyText = body;
         else if (body && typeof body === "object" && !(body instanceof FormData)) {
           try { bodyText = JSON.stringify(body); } catch {}
         }
 
-        const looksGen =
-          /generate|completion|chat|messages|api\/|backend|openai|gemini|anthropic/i.test(url) ||
-          /"messages"\s*:|"prompt"\s*:|"model"\s*:/.test(bodyText);
-
-        if (looksGen && (url || bodyText)) {
-          const parsed = safeJsonParse(bodyText);
-          const model = extractModel(parsed) || "";
-          const { kind, why } = classifyRouteFromText(url, bodyText);
-          tagRoute({ kind, why, model, url });
+        if (looksGen(url, bodyText) && NEEDLE_4141.test(`${url}\n${bodyText}`)) {
+          pushCopilotToken("needle_4141_in_url_or_body", url);
         }
       } catch {}
       return origSend.call(this, body);
@@ -208,49 +162,17 @@
   })();
 
   // =========================
-  // 저장/카운트
+  // 메시지 파싱/중복 방지
   // =========================
-  function todayKeyLocal() {
-    const d = new Date();
-    return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
-  }
-
-  function getSettings() {
-    const { extensionSettings } = getCtx();
-    if (!extensionSettings[MODULE]) {
-      extensionSettings[MODULE] = { total: 0, byDay: {}, lastSig: "" };
-    }
-    const s = extensionSettings[MODULE];
-    if (!s.byDay) s.byDay = {};
-    if (typeof s.total !== "number") s.total = 0;
-    if (typeof s.lastSig !== "string") s.lastSig = "";
-    return s;
-  }
-
-  function save() {
-    getCtx().saveSettingsDebounced();
-  }
-
   function getMsgText(msg) {
     if (!msg) return "";
-    const candidates = [
-      msg.mes, msg.message, msg.content, msg.text,
-      msg?.data?.mes, msg?.data?.content, msg?.data?.message
-    ];
-    return candidates.find(v => typeof v === "string") ?? "";
+    const cands = [msg.mes, msg.message, msg.content, msg.text, msg?.data?.mes, msg?.data?.content, msg?.data?.message];
+    return cands.find(v => typeof v === "string") ?? "";
   }
-
   function isErrorLike(msg) {
     if (!msg) return false;
-    return (
-      msg.is_error === true ||
-      msg.error === true ||
-      (typeof msg.error === "string" && msg.error.trim().length > 0) ||
-      msg.type === "error" ||
-      msg.status === "error"
-    );
+    return msg.is_error === true || msg.error === true || msg.type === "error" || msg.status === "error";
   }
-
   function signatureFromMessage(msg) {
     const text = getMsgText(msg).trim();
     const time =
@@ -259,15 +181,20 @@
       (typeof msg?.id === "string" ? msg.id : "");
     return `${time}|${text.slice(0, 80)}`;
   }
-
   function lastAssistant(chat) {
     for (let i = chat.length - 1; i >= 0; i--) {
       const m = chat[i];
-      if (m?.is_user === false || m?.role === "assistant") return m;
+      const isAssistant =
+        (m?.is_user === false) || (m?.is_user === "false") ||
+        (m?.role === "assistant") || (m?.sender === "assistant");
+      if (isAssistant) return m;
     }
     return null;
   }
 
+  // =========================
+  // 카운트
+  // =========================
   function increment() {
     const s = getSettings();
     const t = todayKeyLocal();
@@ -276,6 +203,45 @@
     save();
     addLog(`✅ COUNT +1 (today=${s.byDay[t]}, total=${s.total})`);
     if (document.getElementById(OVERLAY_ID)?.getAttribute("data-open") === "1") renderDashboard();
+  }
+
+  // LOCK 로직
+  function shouldCountNow() {
+    const s = getSettings();
+    if (s.lockMode === "on") return { ok: true, why: "LOCK=ON" };
+    if (s.lockMode === "off") return { ok: false, why: "LOCK=OFF" };
+
+    // AUTO
+    const token = consumeCopilotToken();
+    if (!token) return { ok: false, why: "AUTO(no token)" };
+    return { ok: true, why: `AUTO(token:${token.why})` };
+  }
+
+  function tryCountFromLastAssistant(eventName) {
+    addLog(`📨 ${eventName}`);
+
+    const decision = shouldCountNow();
+    if (!decision.ok) {
+      addLog(`❌ skip (${decision.why}) queue=${copilotQueue.length}`);
+      return;
+    }
+    addLog(`✅ pass (${decision.why}) queue=${copilotQueue.length}`);
+
+    const c = getCtx();
+    const msg = lastAssistant(c.chat ?? []);
+    if (!msg) { addLog("❌ no assistant msg"); return; }
+    if (isErrorLike(msg)) { addLog("❌ error msg"); return; }
+
+    const text = getMsgText(msg);
+    if (!text.trim()) { addLog("❌ empty msg"); return; }
+
+    const s = getSettings();
+    const sig = signatureFromMessage(msg);
+    if (!sig || sig === "none|") { addLog("❌ bad sig"); return; }
+    if (s.lastSig === sig) { addLog("❌ dup msg"); return; }
+
+    s.lastSig = sig;
+    increment();
   }
 
   // =========================
@@ -311,23 +277,12 @@
         .ccLabel{font-size:0.8em;opacity:0.7;margin-bottom:6px;}
         .ccValue{font-size:1.8em;font-weight:700;}
         .ccSmall{font-size:0.7em;opacity:0.6;margin-top:4px;}
-        #ccBars{background:rgba(255,255,255,0.03);border-radius:12px;padding:12px;margin-bottom:12px;}
-        .barsTitle{display:flex;justify-content:space-between;margin-bottom:10px;font-size:0.85em;}
-        .ccBarRow{display:flex;align-items:center;gap:6px;margin-bottom:6px;}
-        .ccBarDate{width:45px;font-size:0.75em;opacity:0.7;}
-        .ccBarTrack{flex:1;height:20px;background:rgba(255,255,255,0.1);border-radius:4px;overflow:hidden;}
-        .ccBarFill{height:100%;background:linear-gradient(90deg,#4a9eff,#6b5fff);}
-        .ccBarNum{width:25px;text-align:right;font-size:0.75em;font-weight:600;}
-        .ccSection{background:rgba(255,255,255,0.03);border-radius:12px;padding:12px;margin-bottom:12px;}
-        .ccSectionTitle{font-size:0.9em;font-weight:600;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;}
-        #ccStatus{display:grid;grid-template-columns:1fr;gap:8px;font-size:0.75em;margin-bottom:8px;}
-        #ccStatus div{padding:8px;background:rgba(255,255,255,0.05);border-radius:6px;word-break:break-all;}
+        .ccRow{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;}
+        .ccBtn{padding:8px 12px;border-radius:8px;border:1px solid rgba(255,255,255,0.2);background:rgba(255,255,255,0.1);color:white;cursor:pointer;font-size:0.85em;white-space:nowrap;}
+        .ccBtn.primary{background:rgba(59,130,246,0.35);border-color:rgba(59,130,246,0.6);}
+        .ccBtn.danger{background:rgba(220,38,38,0.2);border-color:rgba(220,38,38,0.4);}
         #ccLogs{background:rgba(0,0,0,0.4);border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:10px;max-height:320px;overflow-y:auto;font-family:monospace;font-size:0.65em;line-height:1.4;}
         #ccLogs div{padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.03);}
-        #ccModal footer{padding:12px 16px;border-top:1px solid rgba(255,255,255,0.1);display:flex;gap:8px;justify-content:flex-end;position:sticky;bottom:0;background:#1e1e1e;flex-wrap:wrap;}
-        .ccBtn{padding:8px 14px;border-radius:8px;border:1px solid rgba(255,255,255,0.2);background:rgba(255,255,255,0.1);color:white;cursor:pointer;font-size:0.85em;white-space:nowrap;}
-        .ccBtn.danger{background:rgba(220,38,38,0.2);border-color:rgba(220,38,38,0.4);}
-        .ccBtn.primary{background:rgba(59,130,246,0.3);border-color:rgba(59,130,246,0.5);}
       </style>
 
       <div id="ccModal" role="dialog" aria-modal="true">
@@ -346,41 +301,30 @@
             <div class="ccCard">
               <div class="ccLabel">전체</div>
               <div class="ccValue" id="ccDashTotal">0</div>
-              <div class="ccSmall">Copilot(4141 route)만</div>
+              <div class="ccSmall">Copilot(4141)만</div>
             </div>
           </div>
 
-          <div id="ccBars">
-            <div class="barsTitle">
-              <div>최근 7일</div>
-              <div id="ccBarsHint">—</div>
-            </div>
-            <div id="ccBarsList"></div>
-          </div>
-
-          <div class="ccSection">
-            <div class="ccSectionTitle">
-              <span>📡 마지막 라우트(실제 요청 기반)</span>
-              <button class="ccBtn" id="ccClearLog" style="font-size:0.75em;padding:4px 8px;">로그 지우기</button>
-            </div>
-            <div id="ccStatus">
-              <div><div style="opacity:0.7;margin-bottom:4px;">route</div><div id="ccRoute" style="font-weight:600;">-</div></div>
-              <div><div style="opacity:0.7;margin-bottom:4px;">why</div><div id="ccWhy" style="font-weight:600;">-</div></div>
-              <div><div style="opacity:0.7;margin-bottom:4px;">model</div><div id="ccModel" style="font-weight:600;">-</div></div>
-              <div><div style="opacity:0.7;margin-bottom:4px;">url</div><div id="ccUrl" style="font-weight:600;">-</div></div>
-              <div><div style="opacity:0.7;margin-bottom:4px;">age</div><div id="ccAge" style="font-weight:600;">-</div></div>
+          <div class="ccRow">
+            <button class="ccBtn" id="ccModeAuto">MODE: AUTO</button>
+            <button class="ccBtn" id="ccModeOn">LOCK: ON</button>
+            <button class="ccBtn" id="ccModeOff">LOCK: OFF</button>
+            <div style="opacity:.75;font-size:.85em;align-self:center;">
+              현재: <span id="ccModeLabel" style="font-weight:700;">-</span> /
+              queue=<span id="ccQueueLabel" style="font-weight:700;">0</span>
             </div>
           </div>
 
-          <div class="ccSection">
-            <div class="ccSectionTitle"><span>📋 실시간 로그</span></div>
-            <div id="ccLogs">로그 대기 중...</div>
+          <div class="ccRow">
+            <button class="ccBtn danger" id="ccResetBtn">전체 리셋</button>
+            <button class="ccBtn" id="ccClearLog">로그 지우기</button>
           </div>
+
+          <div id="ccLogs">로그 대기 중...</div>
         </div>
 
-        <footer>
-          <button class="ccBtn danger" id="ccResetBtn">전체 리셋</button>
-          <button class="ccBtn primary" id="ccOpenBtn2">닫기</button>
+        <footer style="padding:12px 16px;border-top:1px solid rgba(255,255,255,0.1);display:flex;justify-content:flex-end;">
+          <button class="ccBtn" id="ccCloseBtn2">닫기</button>
         </footer>
       </div>
     `;
@@ -389,7 +333,23 @@
     document.body.appendChild(overlay);
 
     document.getElementById("ccCloseBtn").addEventListener("click", closeDashboard);
-    document.getElementById("ccOpenBtn2").addEventListener("click", closeDashboard);
+    document.getElementById("ccCloseBtn2").addEventListener("click", closeDashboard);
+
+    document.getElementById("ccModeAuto").addEventListener("click", () => {
+      const s = getSettings(); s.lockMode = "auto"; save();
+      addLog("🔁 mode = AUTO");
+      renderDashboard();
+    });
+    document.getElementById("ccModeOn").addEventListener("click", () => {
+      const s = getSettings(); s.lockMode = "on"; save();
+      addLog("🔒 LOCK = ON (무조건 집계)");
+      renderDashboard();
+    });
+    document.getElementById("ccModeOff").addEventListener("click", () => {
+      const s = getSettings(); s.lockMode = "off"; save();
+      addLog("🧊 LOCK = OFF (무조건 미집계)");
+      renderDashboard();
+    });
 
     document.getElementById("ccClearLog").addEventListener("click", () => {
       logs.length = 0;
@@ -402,6 +362,7 @@
       const s = getSettings();
       s.total = 0; s.byDay = {}; s.lastSig = "";
       save();
+      copilotQueue.length = 0;
       logs.length = 0;
       addLog("🗑️ reset done");
       renderDashboard();
@@ -413,7 +374,6 @@
     renderDashboard();
     document.getElementById(OVERLAY_ID)?.setAttribute("data-open", "1");
   }
-
   function closeDashboard() {
     document.getElementById(OVERLAY_ID)?.setAttribute("data-open", "0");
   }
@@ -422,43 +382,20 @@
     ensureDashboard();
     const s = getSettings();
     const t = todayKeyLocal();
-
     document.getElementById("ccDashToday").textContent = String(s.byDay[t] ?? 0);
     document.getElementById("ccDashTotal").textContent = String(s.total ?? 0);
     document.getElementById("ccDashDate").textContent = t;
 
-    const keys = lastNDaysKeysLocal(7);
-    const vals = keys.map(k => s.byDay[k] ?? 0);
-    const max = Math.max(1, ...vals);
-
-    const list = document.getElementById("ccBarsList");
-    list.innerHTML = "";
-    keys.forEach((k, idx) => {
-      const v = vals[idx];
-      const pct = Math.round((v / max) * 100);
-      list.innerHTML += `
-        <div class="ccBarRow">
-          <div class="ccBarDate">${k.slice(5)}</div>
-          <div class="ccBarTrack"><div class="ccBarFill" style="width:${pct}%"></div></div>
-          <div class="ccBarNum">${v}</div>
-        </div>`;
-    });
-    document.getElementById("ccBarsHint").textContent = `max ${max}`;
-
-    const ageMs = lastRoute.at ? (Date.now() - lastRoute.at) : 0;
-    const ageS = lastRoute.at ? `${Math.floor(ageMs/1000)}s` : "-";
-    document.getElementById("ccRoute").textContent = lastRoute.kind || "-";
-    document.getElementById("ccWhy").textContent = lastRoute.why || "-";
-    document.getElementById("ccModel").textContent = lastRoute.model || "-";
-    document.getElementById("ccUrl").textContent = lastRoute.url ? lastRoute.url.slice(0, 200) : "-";
-    document.getElementById("ccAge").textContent = ageS + (isRecentCopilotRoute() ? " (copilot-window)" : "");
+    pruneQueue();
+    document.getElementById("ccModeLabel").textContent = s.lockMode.toUpperCase();
+    document.getElementById("ccQueueLabel").textContent = String(copilotQueue.length);
 
     const el = document.getElementById("ccLogs");
-    if (el) el.innerHTML = logs.map(l => `<div>${escapeHtml(l)}</div>`).join("");
+    if (el) el.innerHTML = logs.length ? logs.map(l => `<div>${escapeHtml(l)}</div>`).join("") : "로그 대기 중...";
   }
 
   // =========================
-  // 메뉴 주입 (하단 마법봉/확장 메뉴에 반드시 뜨게)
+  // 메뉴 주입
   // =========================
   function findWandMenuContainer() {
     const selectors = [
@@ -466,11 +403,7 @@
       "#extensionsMenu",
       ".extensions_menu",
       ".extensions-menu",
-      ".chatbar_extensions_menu",
-      ".chatbar .dropdown-menu",
-      ".chat_controls .dropdown-menu",
-      ".chat-controls .dropdown-menu",
-      ".dropdown-menu",
+      ".dropdown-menu"
     ];
     for (const sel of selectors) {
       const el = document.querySelector(sel);
@@ -491,7 +424,6 @@
     item.textContent = "🤖 Copilot Counter";
     item.addEventListener("click", (e) => { e.stopPropagation(); openDashboard(); });
     menu.appendChild(item);
-
     addLog("✅ menu injected");
     return true;
   }
@@ -502,68 +434,22 @@
   }
 
   // =========================
-  // 집계: "최근 route가 copilot"인 경우만 카운트
+  // 이벤트 훅
   // =========================
-  function tryCountFromLastAssistant(eventName) {
-    addLog(`📨 ${eventName}`);
-
-    // ✅ 여기서 핵심: 설정이 아니라 "실제 요청 태그"로 판단
-    if (!isRecentCopilotRoute()) {
-      addLog(`❌ skip (route=${lastRoute.kind}, age=${lastRoute.at ? Math.floor((Date.now()-lastRoute.at)/1000) : "-"}s)`);
-      return;
-    }
-
-    // Google 직결이면 무조건 제외(안전장치)
-    if (lastRoute.kind === "google") {
-      addLog("❌ skip (google direct)");
-      return;
-    }
-
-    const c = getCtx();
-    const msg = lastAssistant(c.chat ?? []);
-    if (!msg) { addLog("❌ no assistant msg"); return; }
-    if (isErrorLike(msg)) { addLog("❌ error msg"); return; }
-
-    const text = getMsgText(msg);
-    if (!text.trim()) { addLog("❌ empty msg"); return; }
-
-    const s = getSettings();
-    const sig = signatureFromMessage(msg);
-    if (!sig || sig === "none|") { addLog("❌ bad sig"); return; }
-    if (s.lastSig === sig) { addLog("❌ dup msg"); return; }
-
-    s.lastSig = sig;
-    increment();
-  }
-
   function onGenEnded() { tryCountFromLastAssistant("GENERATION_ENDED"); }
   function onCharacterRendered() { tryCountFromLastAssistant("CHARACTER_MESSAGE_RENDERED"); }
   function onMessageReceived() { tryCountFromLastAssistant("MESSAGE_RECEIVED"); }
 
-  // =========================
-  // main
-  // =========================
   function main() {
-    addLog("🚀 Copilot Counter boot");
+    addLog("🚀 Copilot Counter boot (AUTO + LOCK)");
     ensureDashboard();
     injectWandMenuItem();
     observeForMenu();
 
     const { eventSource, event_types } = getCtx();
-
-    // 생성 시작을 굳이 안써도 됨: 네트워크 요청에서 이미 태깅됨
-    if (event_types?.GENERATION_ENDED) {
-      eventSource.on(event_types.GENERATION_ENDED, onGenEnded);
-      addLog("✓ hook: GENERATION_ENDED");
-    }
-    if (event_types?.CHARACTER_MESSAGE_RENDERED) {
-      eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, onCharacterRendered);
-      addLog("✓ hook: CHARACTER_MESSAGE_RENDERED");
-    }
-    if (event_types?.MESSAGE_RECEIVED) {
-      eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
-      addLog("✓ hook: MESSAGE_RECEIVED");
-    }
+    if (event_types?.GENERATION_ENDED) { eventSource.on(event_types.GENERATION_ENDED, onGenEnded); addLog("✓ hook: GENERATION_ENDED"); }
+    if (event_types?.CHARACTER_MESSAGE_RENDERED) { eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, onCharacterRendered); addLog("✓ hook: CHARACTER_MESSAGE_RENDERED"); }
+    if (event_types?.MESSAGE_RECEIVED) { eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived); addLog("✓ hook: MESSAGE_RECEIVED"); }
 
     addLog("✅ init done");
   }
