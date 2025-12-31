@@ -12,21 +12,19 @@
   const MAX_LOGS = 40;
 
   function addLog(msg) {
-    const time = new Date().toLocaleTimeString('ko-KR');
+    const time = new Date().toLocaleTimeString("ko-KR");
     logs.unshift(`[${time}] ${msg}`);
     if (logs.length > MAX_LOGS) logs.pop();
 
     const logEl = document.getElementById("ccLogs");
     if (logEl) {
-      logEl.innerHTML = logs.map(l => `<div>${l}</div>`).join('');
+      logEl.innerHTML = logs.map((l) => `<div>${l}</div>`).join("");
       logEl.scrollTop = 0;
     }
   }
 
   // =========================
-  // ✅ 엄격한 "현재 활성" 소스/엔드포인트 읽기
-  // - 전체 스캔으로 ':4141' 흔적을 주워오면 오탐이 나서 금지
-  // - '현재 선택된 provider'가 google이면 무조건 카운트 금지
+  // 1) "현재 활성 소스" 읽기 (최대한 확실히)
   // =========================
   function norm(s) {
     return (typeof s === "string" ? s : "").trim();
@@ -36,118 +34,151 @@
     const c = getCtx();
 
     const candidates = [
+      c?.chat_completion_source,
+      c?.settings?.chat_completion_source,
+      c?.settings?.chatCompletionSource,
+      c?.chatCompletionSource,
       c?.settings?.main_api,
       c?.main_api,
-      c?.settings?.chat_completion_source,
-      c?.chat_completion_source,
       c?.settings?.api_source,
       c?.api_source,
-    ].map(norm).filter(Boolean);
+    ];
 
-    if (candidates.length) return candidates[0].toLowerCase();
+    const v = candidates.map(norm).find(Boolean);
+    if (v) return v.toLowerCase();
 
-    // DOM select fallback(설정 UI가 열려있을 때만)
+    // DOM select fallback (설정 패널 열려 있을 때)
     try {
       const selects = Array.from(document.querySelectorAll("select"));
       for (const sel of selects) {
         const val = norm(sel?.value).toLowerCase();
+        if (!val) continue;
         if (
           val.includes("openai") ||
           val.includes("google") ||
           val.includes("gemini") ||
           val.includes("openrouter") ||
+          val.includes("claude") ||
           val.includes("anthropic") ||
-          val.includes("claude")
-        ) return val;
+          val.includes("custom") ||
+          val.includes("chat")
+        ) {
+          return val;
+        }
       }
     } catch (_) {}
 
     return "";
   }
 
-  function getOpenAIEndpointStrict() {
-    const c = getCtx();
-
-    const candidates = [
-      c?.openai_settings?.base_url,
-      c?.openai_settings?.api_url,
-      c?.oai_settings?.base_url,
-      c?.oai_settings?.api_url,
-      c?.settings?.api_url,
-      c?.settings?.base_url,
-      c?.api_url,
-      c?.base_url,
-    ].map(norm).filter(Boolean);
-
-    if (candidates.length) return candidates[0].toLowerCase();
-
-    // DOM input fallback (설정 UI가 열려있을 때만)
-    try {
-      const inputs = Array.from(document.querySelectorAll("input"));
-      for (const el of inputs) {
-        const v = norm(el?.value).toLowerCase();
-        if (!v) continue;
-        const looksLikeUrl = v.startsWith("http://") || v.startsWith("https://");
-        if (!looksLikeUrl) continue;
-        if (v.includes("/v1") || v.includes("localhost") || v.includes("127.0.0.1")) return v;
-      }
-    } catch (_) {}
-
-    return "";
-  }
-
+  // =========================
+  // 2) endpoint 엄격 탐지
+  // - "첫 후보"를 믿지 말고
+  // - openai 관련 설정 묶음 안에서 4141을 최우선으로 찾는다
+  // =========================
   function is4141Endpoint(endpoint) {
     const ep = (endpoint || "").toLowerCase();
     return (
       ep.includes("localhost:4141") ||
       ep.includes("127.0.0.1:4141") ||
       ep.includes("0.0.0.0:4141") ||
-      ep.includes(":4141/")
+      ep.includes(":4141/") ||
+      ep.endsWith(":4141")
     );
   }
 
-  // =========================
-  // ✅ "Copilot인지" 판정: 오탐 방지 버전
-  // =========================
-  function analyzeCopilotStrict() {
-    addLog("🔍 Copilot 분석(엄격) 시작...");
+  function pickBestEndpointFromObjects(objs) {
+    const urls = [];
 
+    const seen = new Set();
+    function walk(node, depth) {
+      if (!node || typeof node !== "object" || depth <= 0) return;
+      if (seen.has(node)) return;
+      seen.add(node);
+
+      for (const [k, v] of Object.entries(node)) {
+        if (typeof v === "string") {
+          const s = v.trim();
+          const lower = s.toLowerCase();
+          const looksUrl = lower.startsWith("http://") || lower.startsWith("https://");
+          if (looksUrl || lower.includes("/v1") || lower.includes("localhost") || lower.includes("127.0.0.1")) {
+            urls.push({ key: k, value: s });
+          }
+        } else if (v && typeof v === "object") {
+          walk(v, depth - 1);
+        }
+      }
+    }
+
+    objs.forEach((o) => walk(o, 5));
+
+    // 1) 4141 포함 URL 최우선
+    const hit4141 = urls.find((u) => is4141Endpoint(u.value));
+    if (hit4141) return hit4141.value.toLowerCase();
+
+    // 2) 그 외에는 /v1 포함 URL 우선
+    const hitV1 = urls.find((u) => u.value.toLowerCase().includes("/v1"));
+    if (hitV1) return hitV1.value.toLowerCase();
+
+    // 3) 마지막 fallback: 아무 URL이나
+    const hitAny = urls.find((u) => u.value.toLowerCase().startsWith("http"));
+    return hitAny ? hitAny.value.toLowerCase() : "";
+  }
+
+  function getOpenAIEndpointStrict() {
+    const c = getCtx();
+
+    // ✅ 핵심: openai 관련 설정 객체들만 스캔 (전체 ctx 스캔 금지)
+    const candidates = [
+      c?.openai_settings,
+      c?.oai_settings,
+      c?.settings?.openai_settings,
+      c?.settings?.oai_settings,
+      c?.settings?.openai,
+      c?.settings?.oai,
+      c?.settings, // 마지막 보험 (하지만 openaiish 판정과 함께만 사용)
+    ].filter(Boolean);
+
+    const picked = pickBestEndpointFromObjects(candidates);
+    return picked || "";
+  }
+
+  function analyzeCopilotStrict() {
     const src = getActiveSourceStrict();
     const ep = getOpenAIEndpointStrict();
 
     addLog(`📌 활성 소스: ${src || "(없음)"}`);
-    addLog(`🔗 OpenAI endpoint: ${ep || "(없음)"}`);
+    addLog(`🔗 OpenAI endpoint 후보: ${ep || "(없음)"}`);
 
+    // ✅ Google/Gemini면 무조건 OFF
     const isGoogle =
-      src.includes("google") ||
-      src.includes("gemini") ||
-      src.includes("ai studio") ||
-      src === "google" ||
-      src === "gemini";
-
+      src.includes("google") || src.includes("gemini") || src.includes("ai studio") || src === "google" || src === "gemini";
     if (isGoogle) {
-      addLog("❌ 현재 소스=Google/Gemini → Copilot 집계 금지");
+      addLog("❌ 소스=Google/Gemini → Copilot 집계 금지");
       return { isCopilot: false, reason: `active_source=${src}`, endpoint: "", source: src };
     }
 
-    const isOpenRouter = src.includes("openrouter");
-    if (isOpenRouter) {
-      addLog("❌ 현재 소스=OpenRouter → Copilot 집계 금지");
+    // ✅ OpenRouter도 OFF
+    if (src.includes("openrouter")) {
+      addLog("❌ 소스=OpenRouter → Copilot 집계 금지");
       return { isCopilot: false, reason: `active_source=${src}`, endpoint: "", source: src };
     }
 
+    // ✅ OpenAI 계열(혹은 소스 못읽는 환경)에서만 endpoint로 판정
     const isOpenAIish =
       src.includes("openai") ||
       src.includes("openai-compatible") ||
       src.includes("chat completion") ||
       src.includes("custom") ||
-      src === ""; // 소스 키를 못 찾는 환경 대비: endpoint로 판정 허용
+      src.includes("oai") ||
+      src === "";
 
     if (!isOpenAIish) {
-      addLog("❌ 현재 소스가 OpenAI 계열이 아님 → Copilot 집계 금지");
+      addLog("❌ 소스가 OpenAI 계열이 아님 → Copilot 집계 금지");
       return { isCopilot: false, reason: `active_source_not_openaiish=${src || "(none)"}`, endpoint: "", source: src };
     }
 
+    // ✅ 진짜 Copilot 조건: endpoint가 4141
     if (is4141Endpoint(ep)) {
       addLog("✅ Copilot 확정 (OpenAI 계열 + 4141 endpoint)");
       return { isCopilot: true, reason: "openaiish+endpoint=4141", endpoint: ep, source: src };
@@ -164,6 +195,7 @@
   const GEN_WINDOW_MS = 5 * 60 * 1000;
 
   function tagGenerationStart() {
+    addLog("🔍 Generation 시작 시점 판정...");
     const result = analyzeCopilotStrict();
 
     lastGen = {
@@ -171,15 +203,15 @@
       startedAt: Date.now(),
       source: result.source || "",
       endpoint: result.endpoint || "",
-      reason: result.reason || ""
+      reason: result.reason || "",
     };
 
-    addLog(result.isCopilot ? "🏷️ Generation: COPILOT" : `🏷️ Generation: ${result.reason}`);
+    addLog(result.isCopilot ? "🏷️ 태그: COPILOT" : `🏷️ 태그: NOT (${result.reason})`);
   }
 
   function isThisGenCopilot() {
     if (!lastGen.isCopilot) return false;
-    return (Date.now() - lastGen.startedAt) < GEN_WINDOW_MS;
+    return Date.now() - lastGen.startedAt < GEN_WINDOW_MS;
   }
 
   // =========================
@@ -193,7 +225,11 @@
   function getSettings() {
     const { extensionSettings } = getCtx();
     if (!extensionSettings[MODULE]) {
-      extensionSettings[MODULE] = { total: 0, byDay: {}, lastSig: "" };
+      extensionSettings[MODULE] = {
+        total: 0,
+        byDay: {},
+        lastSig: "",
+      };
     }
     const s = extensionSettings[MODULE];
     if (!s.byDay) s.byDay = {};
@@ -212,7 +248,7 @@
   function getMsgText(msg) {
     if (!msg) return "";
     const candidates = [msg.mes, msg.message, msg.content, msg.text, msg?.data?.mes, msg?.data?.content, msg?.data?.message];
-    return candidates.find(v => typeof v === "string") ?? "";
+    return candidates.find((v) => typeof v === "string") ?? "";
   }
 
   function isErrorLike(msg) {
@@ -265,7 +301,7 @@
       <style>
         #${OVERLAY_ID}{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:10000;align-items:center;justify-content:center;padding:10px;}
         #${OVERLAY_ID}[data-open="1"]{display:flex;}
-        #ccModal{background:#1e1e1e;border-radius:16px;width:100%;max-width:600px;max-height:90vh;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,0.6);}
+        #ccModal{background:#1e1e1e;border-radius:16px;width:100%;max-width:560px;max-height:90vh;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,0.6);}
         #ccModal header{padding:16px;border-bottom:1px solid rgba(255,255,255,0.1);display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;background:#1e1e1e;z-index:1;}
         #ccModal .title{font-size:1.2em;font-weight:600;}
         #ccModal .body{padding:16px;}
@@ -310,7 +346,7 @@
             <div class="ccCard">
               <div class="ccLabel">전체</div>
               <div class="ccValue" id="ccDashTotal">0</div>
-              <div class="ccSmall">Copilot만</div>
+              <div class="ccSmall">Copilot(4141)만</div>
             </div>
           </div>
 
@@ -333,7 +369,7 @@
                 <div id="ccSrc" style="font-weight:600;">-</div>
               </div>
               <div>
-                <div style="opacity:0.7;margin-bottom:4px;">엔드포인트</div>
+                <div style="opacity:0.7;margin-bottom:4px;">엔드포인트(탐지)</div>
                 <div id="ccEndpoint" style="font-weight:600;">-</div>
               </div>
               <div>
@@ -354,31 +390,33 @@
 
         <footer>
           <button class="ccBtn danger" id="ccResetBtn">전체 리셋</button>
-          <button class="ccBtn primary" id="ccScanBtn">🔍 스캔</button>
+          <button class="ccBtn primary" id="ccScanBtn">🔍 수동 스캔</button>
           <button class="ccBtn" id="ccCloseBtn2">닫기</button>
         </footer>
       </div>
     `;
 
-    overlay.addEventListener("click", (e) => { if (e.target === overlay) closeDashboard(); });
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) closeDashboard();
+    });
 
     document.body.appendChild(overlay);
 
-    document.getElementById("ccCloseBtn")?.addEventListener("click", closeDashboard);
-    document.getElementById("ccCloseBtn2")?.addEventListener("click", closeDashboard);
+    document.getElementById("ccCloseBtn").addEventListener("click", closeDashboard);
+    document.getElementById("ccCloseBtn2").addEventListener("click", closeDashboard);
 
-    document.getElementById("ccClearLog")?.addEventListener("click", () => {
+    document.getElementById("ccClearLog").addEventListener("click", () => {
       logs.length = 0;
       addLog("🗑️ 로그 지움");
     });
 
-    document.getElementById("ccScanBtn")?.addEventListener("click", () => {
+    document.getElementById("ccScanBtn").addEventListener("click", () => {
       addLog("🔄 수동 스캔 시작");
       tagGenerationStart();
       renderDashboard();
     });
 
-    document.getElementById("ccResetBtn")?.addEventListener("click", () => {
+    document.getElementById("ccResetBtn").addEventListener("click", () => {
       if (!confirm("전체 데이터를 리셋할까요?")) return;
       const s = getSettings();
       s.total = 0;
@@ -411,7 +449,7 @@
     document.getElementById("ccDashDate").textContent = t;
 
     const keys = lastNDaysKeysLocal(7);
-    const vals = keys.map(k => s.byDay[k] ?? 0);
+    const vals = keys.map((k) => s.byDay[k] ?? 0);
     const max = Math.max(1, ...vals);
 
     const list = document.getElementById("ccBarsList");
@@ -431,15 +469,14 @@
     document.getElementById("ccBarsHint").textContent = `max ${max}`;
 
     const elapsed = lastGen.startedAt ? Math.floor((Date.now() - lastGen.startedAt) / 1000) : 0;
-    document.getElementById("ccGenStatus").textContent =
-      lastGen.isCopilot ? `✅ Copilot (${elapsed}초 전)` : `❌ 아님 (${elapsed}초 전)`;
+    document.getElementById("ccGenStatus").textContent = lastGen.isCopilot ? `✅ Copilot (${elapsed}s)` : `❌ 아님 (${elapsed}s)`;
     document.getElementById("ccSrc").textContent = lastGen.source || "-";
     document.getElementById("ccEndpoint").textContent = lastGen.endpoint || "-";
     document.getElementById("ccReason").textContent = lastGen.reason || "-";
 
     const logEl = document.getElementById("ccLogs");
     if (logEl && logs.length > 0) {
-      logEl.innerHTML = logs.map(l => `<div>${l}</div>`).join('');
+      logEl.innerHTML = logs.map((l) => `<div>${l}</div>`).join("");
     }
   }
 
@@ -447,38 +484,29 @@
   // 메뉴
   // =========================
   function findWandMenuContainer() {
-    const candidates = [
-      "#extensions_menu",
-      "#extensionsMenu",
-      ".extensions_menu",
-      ".extensions-menu",
-      ".chatbar_extensions_menu",
-      ".chatbar .dropdown-menu",
-      ".chat_controls .dropdown-menu",
-      ".chat-controls .dropdown-menu",
-      ".dropdown-menu"
-    ];
-    for (const sel of candidates) {
-      const el = document.querySelector(sel);
-      if (el) return el;
-    }
-    return null;
+    return (
+      document.querySelector("#extensions_menu") ||
+      document.querySelector("#extensionsMenu") ||
+      document.querySelector(".extensions_menu") ||
+      document.querySelector(".extensions-menu") ||
+      document.querySelector(".dropdown-menu")
+    );
   }
 
   function injectWandMenuItem() {
     const menu = findWandMenuContainer();
-    if (!menu) return false;
-    if (menu.querySelector(`#${MENU_ITEM_ID}`)) return true;
+    if (!menu || menu.querySelector(`#${MENU_ITEM_ID}`)) return;
 
     const item = document.createElement("div");
     item.id = MENU_ITEM_ID;
-    item.style.cssText = `padding:10px 12px;cursor:pointer;user-select:none;border-radius:10px;margin:4px 6px;border:1px solid rgba(255,255,255,.10);background:rgba(255,255,255,.04);`;
+    item.style.cssText =
+      "padding:10px 12px;cursor:pointer;user-select:none;border-radius:10px;margin:4px 6px;border:1px solid rgba(255,255,255,.10);background:rgba(255,255,255,.04);";
     item.textContent = "🤖 Copilot Counter";
-    item.addEventListener("click", (e) => { e.stopPropagation(); openDashboard(); });
+    item.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openDashboard();
+    });
     menu.appendChild(item);
-
-    addLog("🪄 메뉴 주입 완료");
-    return true;
   }
 
   function observeForMenu() {
@@ -504,36 +532,57 @@
     addLog(`📨 ${eventName}`);
 
     if (!isThisGenCopilot()) {
-      addLog(`❌ Copilot gen 아님 (${lastGen.reason})`);
+      addLog("❌ Copilot gen 아님 → 카운트 안 함");
       return;
     }
 
     const c = getCtx();
     const msg = lastAssistant(c.chat ?? []);
-    if (!msg) { addLog("❌ 어시스턴트 메시지 없음"); return; }
-    if (isErrorLike(msg)) { addLog("❌ 에러"); return; }
+    if (!msg) {
+      addLog("❌ 어시스턴트 메시지 없음");
+      return;
+    }
+
+    if (isErrorLike(msg)) {
+      addLog("❌ 에러 메시지");
+      return;
+    }
 
     const text = getMsgText(msg);
-    if (!text.trim()) { addLog("❌ 빈 메시지"); return; }
+    if (!text.trim()) {
+      addLog("❌ 빈 메시지");
+      return;
+    }
 
     const s = getSettings();
     const sig = signatureFromMessage(msg);
-    if (s.lastSig === sig) { addLog("❌ 중복"); return; }
+    if (s.lastSig === sig) {
+      addLog("❌ 중복 메시지");
+      return;
+    }
 
     s.lastSig = sig;
     increment();
   }
 
   function onGenStarted() {
-    addLog("🚀 Generation 시작");
+    addLog("🚀 GENERATION_STARTED");
     tagGenerationStart();
     const overlay = document.getElementById(OVERLAY_ID);
     if (overlay?.getAttribute("data-open") === "1") renderDashboard();
   }
 
-  function onGenEnded() { tryCountFromLastAssistant("GEN_END"); }
-  function onCharacterRendered() { tryCountFromLastAssistant("CHAR_RENDER"); }
-  function onMessageReceived() { tryCountFromLastAssistant("MSG_RECV"); }
+  function onGenEnded() {
+    tryCountFromLastAssistant("GENERATION_ENDED");
+  }
+
+  function onCharacterRendered() {
+    tryCountFromLastAssistant("CHARACTER_MESSAGE_RENDERED");
+  }
+
+  function onMessageReceived() {
+    tryCountFromLastAssistant("MESSAGE_RECEIVED");
+  }
 
   function main() {
     addLog("🚀 Copilot Counter 시작");
@@ -544,10 +593,22 @@
 
     const { eventSource, event_types } = getCtx();
 
-    if (event_types?.GENERATION_STARTED) { eventSource.on(event_types.GENERATION_STARTED, onGenStarted); addLog("✓ GENERATION_STARTED"); }
-    if (event_types?.GENERATION_ENDED) { eventSource.on(event_types.GENERATION_ENDED, onGenEnded); addLog("✓ GENERATION_ENDED"); }
-    if (event_types?.CHARACTER_MESSAGE_RENDERED) { eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, onCharacterRendered); addLog("✓ CHARACTER_MESSAGE_RENDERED"); }
-    if (event_types?.MESSAGE_RECEIVED) { eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived); addLog("✓ MESSAGE_RECEIVED"); }
+    if (event_types?.GENERATION_STARTED) {
+      eventSource.on(event_types.GENERATION_STARTED, onGenStarted);
+      addLog("✓ hook: GENERATION_STARTED");
+    }
+    if (event_types?.GENERATION_ENDED) {
+      eventSource.on(event_types.GENERATION_ENDED, onGenEnded);
+      addLog("✓ hook: GENERATION_ENDED");
+    }
+    if (event_types?.CHARACTER_MESSAGE_RENDERED) {
+      eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, onCharacterRendered);
+      addLog("✓ hook: CHARACTER_MESSAGE_RENDERED");
+    }
+    if (event_types?.MESSAGE_RECEIVED) {
+      eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
+      addLog("✓ hook: MESSAGE_RECEIVED");
+    }
 
     addLog("✅ 초기화 완료");
   }
