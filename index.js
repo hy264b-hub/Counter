@@ -5,36 +5,24 @@
 
   const getCtx = () => SillyTavern.getContext();
 
-  // ✅ Copilot(localhost:4141) 요청이 실제로 나갔는지로 판별 (가장 확실)
-  let lastCopilotHitAt = 0;
-  const COPILOT_WINDOW_MS = 2 * 60 * 1000; // 2분 (필요하면 5분으로 늘려도 됨)
+  // --- Copilot(4141) 판별: Custom Endpoint 입력값에서 확인 ---
+  // 너가 말한 값: http://localhost:4141/v1
+  function isCopilot4141Selected() {
+    const needles = ["localhost:4141", "127.0.0.1:4141", "0.0.0.0:4141"];
 
-  (function hookFetchForCopilot4141() {
-    if (window.__copilotCounterFetchHooked) return;
-    window.__copilotCounterFetchHooked = true;
+    // input 요소들 중에 4141이 들어간 값이 있으면 Copilot로 간주
+    const inputs = Array.from(document.querySelectorAll("input"));
+    for (const el of inputs) {
+      const v = (el?.value ?? "").toString().toLowerCase();
+      if (!v) continue;
+      if (needles.some(n => v.includes(n))) return true;
+    }
 
-    const origFetch = window.fetch.bind(window);
+    // 보험: 화면 텍스트에 4141이 박혀있는 경우 (일부 UI가 span으로 보여줄 수 있음)
+    const bodyText = (document.body?.innerText ?? "").toLowerCase();
+    if (needles.some(n => bodyText.includes(n))) return true;
 
-    window.fetch = async (...args) => {
-      try {
-        const input = args[0];
-        const url =
-          (typeof input === "string" && input) ||
-          (input && typeof input.url === "string" && input.url) ||
-          "";
-
-        // 요청 URL에 :4141 이 포함되면 Copilot 사용으로 기록
-        if (url && /(:4141)\b/.test(url)) {
-          lastCopilotHitAt = Date.now();
-        }
-      } catch (_) {}
-
-      return origFetch(...args);
-    };
-  })();
-
-  function wasCopilotRecently() {
-    return (Date.now() - lastCopilotHitAt) <= COPILOT_WINDOW_MS;
+    return false;
   }
 
   // KST/로컬 기준 "오늘"
@@ -52,14 +40,13 @@
       extensionSettings[MODULE] = {
         total: 0,
         byDay: {},
-        // 중복 방지/판정용
-        inFlight: null,         // { chatKey, startSig, copilot }
-        lastCountedSig: {}      // { chatKey: sig }
+        lastSig: "" // 중복 방지
       };
     }
     const s = extensionSettings[MODULE];
     if (!s.byDay) s.byDay = {};
-    if (!s.lastCountedSig) s.lastCountedSig = {};
+    if (typeof s.total !== "number") s.total = 0;
+    if (typeof s.lastSig !== "string") s.lastSig = "";
     return s;
   }
 
@@ -67,11 +54,7 @@
     getCtx().saveSettingsDebounced();
   }
 
-  function chatKey(ctx) {
-    return `${ctx.groupId ?? "nogroup"}:${ctx.characterId ?? "nochar"}`;
-  }
-
-  // ✅ 메시지 텍스트 필드가 버전/모드마다 달라서, 가능한 후보를 다 본다.
+  // 메시지 텍스트 후보 넓게
   function getMsgText(msg) {
     if (!msg) return "";
     const candidates = [
@@ -87,50 +70,17 @@
     return t ?? "";
   }
 
-  // ✅ “에러 메시지” 판단도 방어적으로
   function isErrorLike(msg) {
     if (!msg) return false;
     if (msg.is_error === true) return true;
     if (msg.error === true) return true;
     if (typeof msg.error === "string" && msg.error.trim().length > 0) return true;
-
     if (msg.type === "error") return true;
     if (msg.status === "error") return true;
     return false;
   }
 
-  function lastAssistant(chat) {
-    for (let i = chat.length - 1; i >= 0; i--) {
-      const m = chat[i];
-      if (m?.is_user === false) return m;
-      if (m?.role === "assistant") return m;
-    }
-    return null;
-  }
-
-  // ✅ send_date가 없거나 타입이 달라도 "시그니처"를 만들기
-  function signature(msg) {
-    if (!msg) return "none";
-    const t = getMsgText(msg).trim();
-    const time =
-      (typeof msg.send_date === "number" ? msg.send_date : null) ??
-      (typeof msg.send_date === "string" ? msg.send_date : null) ??
-      (typeof msg?.created === "number" ? msg.created : null) ??
-      (typeof msg?.id === "string" ? msg.id : null) ??
-      "";
-    const head = t.slice(0, 80);
-    return `${String(time)}|${head}`;
-  }
-
-  function isValidAssistant(msg) {
-    if (!msg) return false;
-    if (isErrorLike(msg)) return false;
-    const text = getMsgText(msg);
-    if (typeof text !== "string") return false;
-    if (text.trim().length === 0) return false; // 빈 응답 제외
-    return true;
-  }
-
+  // --- Dashboard UI ---
   function lastNDaysKeysLocal(n = 7) {
     const out = [];
     const base = new Date();
@@ -145,7 +95,6 @@
     return out;
   }
 
-  // --- Dashboard UI ---
   function ensureDashboard() {
     if (document.getElementById(OVERLAY_ID)) return;
 
@@ -194,6 +143,7 @@
     });
 
     document.body.appendChild(overlay);
+
     document.getElementById("ccCloseBtn").addEventListener("click", closeDashboard);
     document.getElementById("ccCloseBtn2").addEventListener("click", closeDashboard);
 
@@ -202,8 +152,7 @@
       const s = getSettings();
       s.total = 0;
       s.byDay = {};
-      s.inFlight = null;
-      s.lastCountedSig = {};
+      s.lastSig = "";
       save();
       renderDashboard();
     });
@@ -300,18 +249,7 @@
     mo.observe(document.body, { childList: true, subtree: true });
   }
 
-  // --- ✅ 카운트 로직: GENERATION_STARTED / GENERATION_ENDED ---
-  function onGenStarted() {
-    const c = getCtx();
-    const s = getSettings();
-    const key = chatKey(c);
-    const msg = lastAssistant(c.chat ?? []);
-
-    // ✅ 이 생성이 Copilot인지 표시(시작 시점)
-    s.inFlight = { chatKey: key, startSig: signature(msg), copilot: wasCopilotRecently() };
-    save();
-  }
-
+  // --- ✅ 카운트 ---
   function increment() {
     const s = getSettings();
     const t = todayKeyLocal();
@@ -323,36 +261,33 @@
     if (overlay?.getAttribute("data-open") === "1") renderDashboard();
   }
 
-  function onGenEnded(payload) {
-    const c = getCtx();
+  // ✅ 가장 안정: MESSAGE_RECEIVED에서 assistant 메시지를 카운트
+  function onMessageReceived(data) {
+    // Copilot 선택 상태가 아닐 때는 집계 안 함
+    if (!isCopilot4141Selected()) return;
+
+    const msg = data?.message ?? data?.msg ?? data;
+
+    const isAssistant =
+      (msg?.is_user === false) ||
+      (msg?.role === "assistant") ||
+      (msg?.sender === "assistant");
+
+    if (!isAssistant) return;
+    if (isErrorLike(msg)) return;
+
+    const text = getMsgText(msg);
+    if (text.trim().length === 0) return;
+
+    // 중복 방지 시그니처
+    const sig =
+      (typeof msg?.send_date === "number" ? String(msg.send_date) : "") ||
+      (typeof msg?.id === "string" ? msg.id : "") ||
+      (text.trim().slice(0, 80));
+
     const s = getSettings();
-    const key = chatKey(c);
-
-    const endedWithError =
-      payload?.is_error === true ||
-      payload?.error === true ||
-      (typeof payload?.error === "string" && payload.error.trim().length > 0);
-
-    if (endedWithError) return;
-
-    const msg = lastAssistant(c.chat ?? []);
-    if (!isValidAssistant(msg)) return;
-
-    const endSig = signature(msg);
-    const startSig = s.inFlight?.chatKey === key ? s.inFlight.startSig : null;
-
-    if (startSig && endSig === startSig) return;
-    if (s.lastCountedSig[key] === endSig) return;
-
-    s.lastCountedSig[key] = endSig;
-
-    // ✅ Copilot(4141) 요청이 있었던 생성만 집계
-    const isCopilotThisGen =
-      (s.inFlight?.chatKey === key && s.inFlight?.copilot === true) || wasCopilotRecently();
-
-    s.inFlight = null;
-
-    if (!isCopilotThisGen) return;
+    if (s.lastSig === sig) return;
+    s.lastSig = sig;
 
     increment();
   }
@@ -364,8 +299,19 @@
 
     const { eventSource, event_types } = getCtx();
 
-    if (event_types.GENERATION_STARTED) eventSource.on(event_types.GENERATION_STARTED, onGenStarted);
-    if (event_types.GENERATION_ENDED) eventSource.on(event_types.GENERATION_ENDED, onGenEnded);
+    // ✅ 핵심: MESSAGE_RECEIVED
+    if (event_types.MESSAGE_RECEIVED) {
+      eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
+    } else {
+      // staging에서 이름이 다를 수도 있어서, 가능한 후보를 몇 개 더 시도
+      const fallbackNames = ["MESSAGE_RECEIVED", "message_received", "MESSAGE_RECEIVE"];
+      for (const name of fallbackNames) {
+        if (event_types[name]) {
+          eventSource.on(event_types[name], onMessageReceived);
+          break;
+        }
+      }
+    }
   }
 
   main();
