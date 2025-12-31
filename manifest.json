@@ -1,0 +1,11 @@
+{
+  "display_name": "Copilot Counter",
+  "loading_order": 50,
+  "js": "index.js",
+  "css": "style.css",
+  "author": "you",
+  "version": "1.0.0",
+  "description": "Counts valid assistant replies (non-empty, non-error) and shows dashboard via wand menu item.",
+  "auto_update": true,
+  "minimum_client_version": "1.0.0"
+}
