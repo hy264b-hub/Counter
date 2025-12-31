@@ -8,7 +8,7 @@
   // 로그
   // =========================
   const logs = [];
-  const MAX_LOGS = 50;
+  const MAX_LOGS = 60;
   function addLog(msg) {
     const time = new Date().toLocaleTimeString("ko-KR");
     logs.unshift(`[${time}] ${msg}`);
@@ -16,44 +16,10 @@
     const el = document.getElementById("ccLogs");
     if (el) el.innerHTML = logs.map(l => `<div>${l}</div>`).join("");
   }
-
-  function norm(s) { return (typeof s === "string" ? s : "").trim(); }
-
-  // =========================
-  // 1) 활성 소스 읽기(최대 신뢰)
-  // =========================
-  function getActiveSource() {
-    const c = getCtx();
-    const candidates = [
-      c?.chat_completion_source,
-      c?.settings?.chat_completion_source,
-      c?.settings?.chatCompletionSource,
-      c?.chatCompletionSource,
-      c?.settings?.main_api,
-      c?.main_api,
-      c?.settings?.api_source,
-      c?.api_source,
-    ];
-    const v = candidates.map(norm).find(Boolean);
-    if (v) return v.toLowerCase();
-
-    // DOM fallback (설정패널 열렸을 때)
-    try {
-      for (const sel of document.querySelectorAll("select")) {
-        const val = norm(sel.value).toLowerCase();
-        if (!val) continue;
-        if (val.includes("openai") || val.includes("google") || val.includes("gemini") || val.includes("openrouter") || val.includes("chat")) {
-          return val;
-        }
-      }
-    } catch (_) {}
-    return "";
-  }
+  function norm(s){ return (typeof s === "string" ? s : "").trim(); }
 
   // =========================
-  // 2) "활성 소스 설정 덩어리"에서 endpoint 추출
-  // - 핵심: openai_settings만 보지 말고, chat completion source 프로필 쪽을 같이 탐색
-  // - 단, src가 google이면 바로 컷
+  // Copilot(4141) 판별
   // =========================
   function is4141(url) {
     const s = (url || "").toLowerCase();
@@ -66,151 +32,179 @@
     );
   }
 
-  // 특정 객체에서 url 후보 키만 뽑기
-  function extractUrlCandidates(obj) {
-    const out = [];
-    if (!obj || typeof obj !== "object") return out;
-    const KEY_HINTS = ["endpoint", "base", "url", "host", "proxy"];
-    for (const [k, v] of Object.entries(obj)) {
-      if (typeof v !== "string") continue;
-      const kk = k.toLowerCase();
-      const vv = v.trim();
-      if (!vv) continue;
-      const looksUrl = vv.toLowerCase().startsWith("http://") || vv.toLowerCase().startsWith("https://");
-      const keyLooks = KEY_HINTS.some(h => kk.includes(h));
-      if (looksUrl || keyLooks || vv.toLowerCase().includes("/v1") || vv.toLowerCase().includes("localhost") || vv.toLowerCase().includes("127.0.0.1")) {
-        out.push(vv);
-      }
-    }
-    return out;
-  }
-
-  // settings 전체에서 "src 관련 설정 객체"를 찾는다 (src가 들어있는 덩어리만 제한적으로)
-  function findConfigBlobsForSource(root, src) {
-    const blobs = [];
-    const seen = new Set();
-
-    function walk(node, depth, path) {
-      if (!node || typeof node !== "object" || depth <= 0) return;
-      if (seen.has(node)) return;
-      seen.add(node);
-
-      try {
-        // 문자열로 대충 stringify해서 src 포함 여부 확인 (너무 깊게 안감)
-        let asStr = "";
-        try { asStr = JSON.stringify(node); } catch (_) {}
-        const hit = asStr && src && asStr.toLowerCase().includes(src);
-        const hasUrlish = asStr && (asStr.includes("http") || asStr.includes("/v1") || asStr.includes("endpoint") || asStr.includes("base_url") || asStr.includes("api_url"));
-
-        // "src도 포함 + urlish도 있음"이면 후보 blob
-        if (hit && hasUrlish) {
-          blobs.push({ path, node });
-        }
-      } catch (_) {}
-
-      for (const [k, v] of Object.entries(node)) {
-        if (v && typeof v === "object") walk(v, depth - 1, path ? `${path}.${k}` : k);
-      }
-    }
-
-    walk(root, 4, "settings");
-    return blobs;
-  }
-
-  // src에 해당하는 endpoint를 최대한 "그 src의 blob"에서만 찾는다
-  function getEndpointForActiveSource(src) {
+  // =========================
+  // 1) 활성 소스(src) 확정 (여기가 제일 중요)
+  // - "google인데도 src가 other"가 나오는 케이스가 있어서
+  //   후보를 최대한 넓게 잡고, '가장 googleish한' 값을 우선한다.
+  // =========================
+  function getActiveSourceStrict() {
     const c = getCtx();
-    const settingsRoot = c?.settings || c || {};
 
-    // 1) src 관련 blob 찾기
-    const blobs = findConfigBlobsForSource(settingsRoot, src);
+    const rawCandidates = [
+      c?.settings?.chat_completion_source,
+      c?.chat_completion_source,
+      c?.settings?.main_api,
+      c?.main_api,
+      c?.settings?.api_source,
+      c?.api_source,
+      c?.settings?.chatCompletionSource,
+      c?.chatCompletionSource,
+      c?.settings?.chatCompletionSetting?.source,
+      c?.settings?.chatCompletionSetting?.selectedSource,
+      c?.settings?.chatCompletionSetting?.activeSource,
+      c?.chatCompletionSetting?.source,
+      c?.chatCompletionSetting?.selectedSource,
+    ].map(norm).filter(Boolean);
 
-    // 2) blob들에서 url 후보 추출 → 4141 우선
-    const urls = [];
-    for (const b of blobs) {
-      const candidates = extractUrlCandidates(b.node);
-      candidates.forEach(u => urls.push({ url: u, where: b.path }));
-    }
+    // 로그에 후보를 다 보여줌 (원인 파악용)
+    addLog(`src 후보: ${rawCandidates.length ? rawCandidates.join(" | ") : "(없음)"}`);
 
-    const hit4141 = urls.find(x => is4141(x.url));
-    if (hit4141) return { url: hit4141.url.toLowerCase(), where: `blob:${hit4141.where}` };
+    const lower = rawCandidates.map(v => v.toLowerCase());
 
-    // 3) 그래도 없으면: "chat_completion" 관련 영역을 별도로 스캔
-    // (src가 openaiish일 때, 여기에서 custom endpoint가 보통 걸림)
-    const extraAreas = [];
-    try {
-      for (const [k, v] of Object.entries(settingsRoot)) {
-        const kk = String(k).toLowerCase();
-        if (kk.includes("chat") || kk.includes("completion") || kk.includes("source") || kk.includes("custom")) {
-          if (v && typeof v === "object") extraAreas.push({ key: k, node: v });
-        }
-      }
-    } catch (_) {}
+    // google/gemini가 하나라도 있으면 그걸로 확정
+    const googleHit = lower.find(v => v.includes("google") || v.includes("gemini") || v.includes("ai studio") || v.includes("aistudio"));
+    if (googleHit) return googleHit;
 
-    const extraUrls = [];
-    for (const a of extraAreas) {
-      const candidates = extractUrlCandidates(a.node);
-      candidates.forEach(u => extraUrls.push({ url: u, where: `area:${a.key}` }));
-    }
-    const hit4141b = extraUrls.find(x => is4141(x.url));
-    if (hit4141b) return { url: hit4141b.url.toLowerCase(), where: hit4141b.where };
+    // openrouter도 우선 확정
+    const orHit = lower.find(v => v.includes("openrouter"));
+    if (orHit) return orHit;
 
-    // 4) 마지막 fallback: openai_settings / oai_settings 쪽에서만 탐색
-    const openaiAreas = [
-      settingsRoot?.openai_settings,
-      settingsRoot?.oai_settings,
-      c?.openai_settings,
-      c?.oai_settings,
-      c?.settings?.openai_settings,
-      c?.settings?.oai_settings,
-    ].filter(Boolean);
+    // openai 계열
+    const oaiHit = lower.find(v => v.includes("openai") || v.includes("openai-compatible") || v.includes("chat completion") || v.includes("custom") || v.includes("oai"));
+    if (oaiHit) return oaiHit;
 
-    const fallbackUrls = [];
-    for (const a of openaiAreas) {
-      extractUrlCandidates(a).forEach(u => fallbackUrls.push({ url: u, where: "openai_settings" }));
-    }
-    const hit4141c = fallbackUrls.find(x => is4141(x.url));
-    if (hit4141c) return { url: hit4141c.url.toLowerCase(), where: hit4141c.where };
-
-    // 5) 없으면 빈값
-    // (여기서 ctx 전체 뒤지면 다시 “Google로 바꿔도 4141 잔상” 문제가 재발해서 금지)
-    return { url: "", where: "none" };
+    // fallback: 첫 번째라도 반환
+    return lower[0] || "";
   }
 
-  function analyzeCopilotNow() {
-    const src = getActiveSource();
-    addLog(`📌 활성 소스(src): ${src || "(없음)"}`);
+  // =========================
+  // 2) "활성 소스별" endpoint만 읽기 (blob 전체 검색 금지)
+  //
+  // - 핵심: settings.chatCompletionSetting 전체에서 찾지 않는다.
+  // - 대신, '소스별 settings 슬롯'에서만 본다.
+  // =========================
+  function pickFirstUrl(obj, keys = []) {
+    if (!obj || typeof obj !== "object") return "";
+    // 명시 키 우선
+    for (const k of keys) {
+      const v = norm(obj?.[k]);
+      if (v) return v;
+    }
+    // fallback: 흔한 키들
+    const fallbackKeys = ["api_url","apiUrl","base_url","baseUrl","endpoint","proxy_url","proxyUrl","host"];
+    for (const k of fallbackKeys) {
+      const v = norm(obj?.[k]);
+      if (v) return v;
+    }
+    return "";
+  }
 
-    // Google/Gemini/OpenRouter는 즉시 차단
-    if (src.includes("google") || src.includes("gemini") || src.includes("ai studio")) {
-      addLog("❌ 소스가 Google/Gemini → Copilot 집계 금지");
+  function getEndpointForActiveSourceStrict(src) {
+    const c = getCtx();
+    const s = c?.settings || {};
+
+    // Google은 endpoint로 판정 안 함 (오탐 방지)
+    if (src.includes("google") || src.includes("gemini") || src.includes("ai studio") || src.includes("aistudio")) {
+      return { url: "", where: "src=google (endpoint ignored)" };
+    }
+
+    // 1) 소스별 settings 슬롯 후보들
+    //    (SillyTavern 버전/확장마다 이름이 다름 → 폭넓게)
+    const slots = [];
+
+    // OpenAI 계열(너의 Copilot이 여기로 붙어 있음)
+    slots.push({ where: "settings.openai_settings", obj: s.openai_settings });
+    slots.push({ where: "settings.oai_settings", obj: s.oai_settings });
+    slots.push({ where: "ctx.openai_settings", obj: c.openai_settings });
+    slots.push({ where: "ctx.oai_settings", obj: c.oai_settings });
+
+    // Custom/OpenAI-compatible 쪽에서 endpoint를 따로 저장하는 케이스
+    slots.push({ where: "settings.custom_endpoint", obj: s.custom_endpoint });
+    slots.push({ where: "settings.customEndpoint", obj: s.customEndpoint });
+
+    // chatCompletionSetting은 "전체 blob"이지만,
+    // 여기서는 "활성 소스에 해당하는 하위 슬롯"만 있으면 그것만 읽는다.
+    // (예: chatCompletionSetting.openai / chatCompletionSetting.custom / chatCompletionSetting.sources[src] 같은 구조)
+    const ccs = s.chatCompletionSetting || c.chatCompletionSetting;
+    if (ccs && typeof ccs === "object") {
+      // 하위 슬롯 후보들 (존재할 때만)
+      if (ccs.openai) slots.push({ where: "chatCompletionSetting.openai", obj: ccs.openai });
+      if (ccs.custom) slots.push({ where: "chatCompletionSetting.custom", obj: ccs.custom });
+      if (ccs.openai_compatible) slots.push({ where: "chatCompletionSetting.openai_compatible", obj: ccs.openai_compatible });
+      if (ccs.openaiCompatible) slots.push({ where: "chatCompletionSetting.openaiCompatible", obj: ccs.openaiCompatible });
+
+      // sources 맵 형태
+      if (ccs.sources && typeof ccs.sources === "object") {
+        // src 키로 직접 접근 시도
+        const k = Object.keys(ccs.sources).find(k => k.toLowerCase() === src.toLowerCase());
+        if (k) slots.push({ where: `chatCompletionSetting.sources["${k}"]`, obj: ccs.sources[k] });
+      }
+
+      // profiles/entries 배열 형태(각 항목에 source/name이 있음)
+      const arr = ccs.profiles || ccs.entries || ccs.items || ccs.list;
+      if (Array.isArray(arr)) {
+        const hit = arr.find(x => {
+          const v = norm(x?.source || x?.name || x?.id).toLowerCase();
+          return v && (v === src || v.includes(src));
+        });
+        if (hit) slots.push({ where: "chatCompletionSetting.(profiles hit)", obj: hit });
+      }
+    }
+
+    // 2) 슬롯들에서 url 뽑기
+    const tried = [];
+    for (const slot of slots) {
+      if (!slot?.obj) continue;
+      const url = pickFirstUrl(slot.obj);
+      if (url) {
+        tried.push(`${slot.where} -> ${url}`);
+        return { url: url.toLowerCase(), where: slot.where, tried };
+      }
+      tried.push(`${slot.where} -> (no url)`);
+    }
+
+    return { url: "", where: "no-endpoint-found", tried };
+  }
+
+  // =========================
+  // 3) 최종 판정
+  // =========================
+  function analyzeCopilotNow() {
+    const src = getActiveSourceStrict();
+    addLog(`📌 활성 src = ${src || "(없음)"}`);
+
+    // Google/Gemini/OpenRouter는 무조건 Copilot 금지 (여기서 끝)
+    if (src.includes("google") || src.includes("gemini") || src.includes("ai studio") || src.includes("aistudio")) {
+      addLog("❌ src=Google/Gemini → Copilot 금지");
       return { isCopilot: false, reason: `source=${src}`, source: src, endpoint: "" };
     }
     if (src.includes("openrouter")) {
-      addLog("❌ 소스가 OpenRouter → Copilot 집계 금지");
+      addLog("❌ src=OpenRouter → Copilot 금지");
       return { isCopilot: false, reason: `source=${src}`, source: src, endpoint: "" };
     }
 
-    // endpoint는 “해당 src 설정 blob에서만” 추출
-    const ep = getEndpointForActiveSource(src);
-    addLog(`🔗 endpoint(추출): ${ep.url || "(없음)"}  [${ep.where}]`);
+    // endpoint는 '활성 소스 슬롯'에서만 읽는다
+    const ep = getEndpointForActiveSourceStrict(src);
+    addLog(`🔗 endpoint = ${ep.url || "(없음)"}  [${ep.where}]`);
+    if (ep.tried?.length) addLog(`endpoint 탐색: ${ep.tried.slice(0, 3).join(" | ")}${ep.tried.length > 3 ? " ..." : ""}`);
 
-    // src가 openaiish(또는 못 읽는 환경)일 때만 endpoint로 Copilot 판정
+    // OpenAI 계열만 Copilot 후보
     const isOpenAIish =
       src.includes("openai") ||
       src.includes("openai-compatible") ||
       src.includes("chat completion") ||
       src.includes("custom") ||
       src.includes("oai") ||
-      src === "";
+      src === "" ||
+      src === "other";
 
     if (!isOpenAIish) {
-      addLog("❌ 소스가 OpenAI 계열이 아님 → Copilot 금지");
+      addLog("❌ OpenAI 계열 아님 → Copilot 금지");
       return { isCopilot: false, reason: `not_openaiish_source=${src}`, source: src, endpoint: ep.url || "" };
     }
 
     if (is4141(ep.url)) {
-      addLog("✅ Copilot 확정: (OpenAI 계열 + endpoint=4141)");
+      addLog("✅ Copilot 확정: (OpenAI 계열 + 4141)");
       return { isCopilot: true, reason: `openaiish+4141(${ep.where})`, source: src, endpoint: ep.url };
     }
 
@@ -227,13 +221,7 @@
   function tagGenerationStart() {
     addLog("🚀 GENERATION_STARTED → 판정");
     const r = analyzeCopilotNow();
-    lastGen = {
-      isCopilot: r.isCopilot,
-      startedAt: Date.now(),
-      source: r.source || "",
-      endpoint: r.endpoint || "",
-      reason: r.reason || "",
-    };
+    lastGen = { isCopilot: r.isCopilot, startedAt: Date.now(), source: r.source || "", endpoint: r.endpoint || "", reason: r.reason || "" };
     addLog(r.isCopilot ? "🏷️ 태그=Copilot" : `🏷️ 태그=NOT (${r.reason})`);
   }
 
@@ -248,22 +236,16 @@
     const d = new Date();
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
   }
-
   function getSettings() {
     const { extensionSettings } = getCtx();
-    if (!extensionSettings[MODULE]) {
-      extensionSettings[MODULE] = { total: 0, byDay: {}, lastSig: "" };
-    }
+    if (!extensionSettings[MODULE]) extensionSettings[MODULE] = { total: 0, byDay: {}, lastSig: "" };
     const s = extensionSettings[MODULE];
     if (!s.byDay) s.byDay = {};
     if (typeof s.total !== "number") s.total = 0;
     if (typeof s.lastSig !== "string") s.lastSig = "";
     return s;
   }
-
-  function save() {
-    getCtx().saveSettingsDebounced();
-  }
+  function save() { getCtx().saveSettingsDebounced(); }
 
   // =========================
   // 메시지 파싱
@@ -273,24 +255,15 @@
     const candidates = [msg.mes, msg.message, msg.content, msg.text, msg?.data?.mes, msg?.data?.content, msg?.data?.message];
     return candidates.find(v => typeof v === "string") ?? "";
   }
-
   function isErrorLike(msg) {
     if (!msg) return false;
-    return (
-      msg.is_error === true ||
-      msg.error === true ||
-      (typeof msg.error === "string" && msg.error.trim().length > 0) ||
-      msg.type === "error" ||
-      msg.status === "error"
-    );
+    return (msg.is_error === true || msg.error === true || (typeof msg.error === "string" && msg.error.trim().length > 0) || msg.type === "error" || msg.status === "error");
   }
-
   function signatureFromMessage(msg) {
     const text = getMsgText(msg).trim();
     const time = String(msg?.send_date || msg?.created || msg?.id || "");
     return `${time}|${text.slice(0, 80)}`;
   }
-
   function lastAssistant(chat) {
     for (let i = chat.length - 1; i >= 0; i--) {
       const m = chat[i];
@@ -325,7 +298,7 @@
         #${OVERLAY_ID}{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:10000;align-items:center;justify-content:center;padding:10px;}
         #${OVERLAY_ID}[data-open="1"]{display:flex;}
         #ccModal{background:#1e1e1e;border-radius:16px;width:100%;max-width:560px;max-height:90vh;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,0.6);}
-        #ccModal header{padding:16px;border-bottom:1px solid rgba(255,255,255,0.1);display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;background:#1e1e1e;z-index:1;}
+        #ccModal header{padding:16px;border-bottom:1px solid rgba(255,255,255,0.1);display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;background:#1e1e1e;}
         #ccModal .title{font-size:1.2em;font-weight:600;}
         #ccModal .body{padding:16px;}
         .ccCards{display:flex;gap:10px;margin-bottom:16px;}
@@ -344,11 +317,10 @@
         .ccSectionTitle{font-size:0.9em;font-weight:600;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;}
         #ccStatus{display:grid;grid-template-columns:1fr;gap:8px;font-size:0.75em;margin-bottom:8px;}
         #ccStatus div{padding:8px;background:rgba(255,255,255,0.05);border-radius:6px;word-break:break-all;}
-        #ccLogs{background:rgba(0,0,0,0.4);border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:10px;max-height:300px;overflow-y:auto;font-family:monospace;font-size:0.65em;line-height:1.4;}
+        #ccLogs{background:rgba(0,0,0,0.4);border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:10px;max-height:320px;overflow-y:auto;font-family:monospace;font-size:0.65em;line-height:1.4;}
         #ccLogs div{padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.03);}
         #ccModal footer{padding:12px 16px;border-top:1px solid rgba(255,255,255,0.1);display:flex;gap:8px;justify-content:flex-end;position:sticky;bottom:0;background:#1e1e1e;flex-wrap:wrap;}
         .ccBtn{padding:8px 14px;border-radius:8px;border:1px solid rgba(255,255,255,0.2);background:rgba(255,255,255,0.1);color:white;cursor:pointer;font-size:0.85em;white-space:nowrap;}
-        .ccBtn:active{background:rgba(255,255,255,0.2);}
         .ccBtn.danger{background:rgba(220,38,38,0.2);border-color:rgba(220,38,38,0.4);}
         .ccBtn.primary{background:rgba(59,130,246,0.3);border-color:rgba(59,130,246,0.5);}
       </style>
@@ -382,10 +354,7 @@
           </div>
 
           <div class="ccSection">
-            <div class="ccSectionTitle">
-              <span>📊 현재 Generation 상태</span>
-              <span id="ccGenStatus" style="font-size:0.85em;opacity:0.8;">—</span>
-            </div>
+            <div class="ccSectionTitle"><span>📊 현재 Generation 상태</span><span id="ccGenStatus" style="font-size:0.85em;opacity:0.8;">—</span></div>
             <div id="ccStatus">
               <div><div style="opacity:0.7;margin-bottom:4px;">소스</div><div id="ccSrc" style="font-weight:600;">-</div></div>
               <div><div style="opacity:0.7;margin-bottom:4px;">엔드포인트(탐지)</div><div id="ccEndpoint" style="font-weight:600;">-</div></div>
@@ -411,8 +380,8 @@
     `;
 
     overlay.addEventListener("click", (e) => { if (e.target === overlay) closeDashboard(); });
-
     document.body.appendChild(overlay);
+
     document.getElementById("ccCloseBtn").addEventListener("click", closeDashboard);
     document.getElementById("ccCloseBtn2").addEventListener("click", closeDashboard);
 
@@ -485,7 +454,7 @@
   }
 
   // =========================
-  // 메뉴(마법봉)
+  // 메뉴
   // =========================
   function findWandMenuContainer() {
     return (
@@ -524,9 +493,7 @@
     s.byDay[t] = (s.byDay[t] ?? 0) + 1;
     addLog(`✅ 카운트! 오늘=${s.byDay[t]} 전체=${s.total}`);
     save();
-
-    const overlay = document.getElementById(OVERLAY_ID);
-    if (overlay?.getAttribute("data-open") === "1") renderDashboard();
+    if (document.getElementById(OVERLAY_ID)?.getAttribute("data-open") === "1") renderDashboard();
   }
 
   function tryCountFromLastAssistant(eventName) {
@@ -572,7 +539,6 @@
     if (event_types?.GENERATION_ENDED) { eventSource.on(event_types.GENERATION_ENDED, onGenEnded); addLog("✓ hook: GENERATION_ENDED"); }
     if (event_types?.CHARACTER_MESSAGE_RENDERED) { eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, onCharacterRendered); addLog("✓ hook: CHARACTER_MESSAGE_RENDERED"); }
     if (event_types?.MESSAGE_RECEIVED) { eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived); addLog("✓ hook: MESSAGE_RECEIVED"); }
-
     addLog("✅ 초기화 완료");
   }
 
