@@ -5,30 +5,37 @@
 
   const getCtx = () => SillyTavern.getContext();
 
-  // ✅ Copilot(localhost:4141)일 때만 집계
-function isCopilot4141() {
-  const c = getCtx();
+  // ✅ Copilot(localhost:4141) 요청이 실제로 나갔는지로 판별 (가장 확실)
+  let lastCopilotHitAt = 0;
+  const COPILOT_WINDOW_MS = 2 * 60 * 1000; // 2분 (필요하면 5분으로 늘려도 됨)
 
-  const candidates = [
-    c?.settings?.api_url,
-    c?.settings?.apiUrl,
-    c?.api_url,
-    c?.apiUrl,
-    c?.oai_settings?.api_url,
-    c?.oai_settings?.apiUrl,
-    c?.openai_settings?.api_url,
-    c?.openai_settings?.apiUrl
-  ];
+  (function hookFetchForCopilot4141() {
+    if (window.__copilotCounterFetchHooked) return;
+    window.__copilotCounterFetchHooked = true;
 
-  const base = (candidates.find(v => typeof v === "string") || "").toLowerCase();
+    const origFetch = window.fetch.bind(window);
 
-  return (
-    base.includes("localhost:4141") ||
-    base.includes("127.0.0.1:4141") ||
-    base.includes("0.0.0.0:4141")
-  );
-}
+    window.fetch = async (...args) => {
+      try {
+        const input = args[0];
+        const url =
+          (typeof input === "string" && input) ||
+          (input && typeof input.url === "string" && input.url) ||
+          "";
 
+        // 요청 URL에 :4141 이 포함되면 Copilot 사용으로 기록
+        if (url && /(:4141)\b/.test(url)) {
+          lastCopilotHitAt = Date.now();
+        }
+      } catch (_) {}
+
+      return origFetch(...args);
+    };
+  })();
+
+  function wasCopilotRecently() {
+    return (Date.now() - lastCopilotHitAt) <= COPILOT_WINDOW_MS;
+  }
 
   // KST/로컬 기준 "오늘"
   function todayKeyLocal() {
@@ -46,7 +53,7 @@ function isCopilot4141() {
         total: 0,
         byDay: {},
         // 중복 방지/판정용
-        inFlight: null,         // { chatKey, startSig }
+        inFlight: null,         // { chatKey, startSig, copilot }
         lastCountedSig: {}      // { chatKey: sig }
       };
     }
@@ -87,7 +94,6 @@ function isCopilot4141() {
     if (msg.error === true) return true;
     if (typeof msg.error === "string" && msg.error.trim().length > 0) return true;
 
-    // 어떤 프록시는 { type: "error" } 같은 걸 넣기도 해서…
     if (msg.type === "error") return true;
     if (msg.status === "error") return true;
     return false;
@@ -96,7 +102,6 @@ function isCopilot4141() {
   function lastAssistant(chat) {
     for (let i = chat.length - 1; i >= 0; i--) {
       const m = chat[i];
-      // staging에서 is_user 대신 role이 들어가는 케이스도 방어
       if (m?.is_user === false) return m;
       if (m?.role === "assistant") return m;
     }
@@ -104,8 +109,6 @@ function isCopilot4141() {
   }
 
   // ✅ send_date가 없거나 타입이 달라도 "시그니처"를 만들기
-  // - 시간/아이디가 있으면 포함
-  // - 없으면 텍스트 일부로 대체
   function signature(msg) {
     if (!msg) return "none";
     const t = getMsgText(msg).trim();
@@ -115,7 +118,6 @@ function isCopilot4141() {
       (typeof msg?.created === "number" ? msg.created : null) ??
       (typeof msg?.id === "string" ? msg.id : null) ??
       "";
-    // 텍스트가 너무 길면 앞부분만
     const head = t.slice(0, 80);
     return `${String(time)}|${head}`;
   }
@@ -304,7 +306,9 @@ function isCopilot4141() {
     const s = getSettings();
     const key = chatKey(c);
     const msg = lastAssistant(c.chat ?? []);
-    s.inFlight = { chatKey: key, startSig: signature(msg) };
+
+    // ✅ 이 생성이 Copilot인지 표시(시작 시점)
+    s.inFlight = { chatKey: key, startSig: signature(msg), copilot: wasCopilotRecently() };
     save();
   }
 
@@ -324,7 +328,6 @@ function isCopilot4141() {
     const s = getSettings();
     const key = chatKey(c);
 
-    // 에러로 끝난 경우가 payload에 잡히면 제외(없어도 아래 검증이 막아줌)
     const endedWithError =
       payload?.is_error === true ||
       payload?.error === true ||
@@ -338,17 +341,19 @@ function isCopilot4141() {
     const endSig = signature(msg);
     const startSig = s.inFlight?.chatKey === key ? s.inFlight.startSig : null;
 
-    // 시작과 동일한 메시지면 “새 답변이 추가되지 않음”
     if (startSig && endSig === startSig) return;
-
-    // 중복 방지 (같은 endSig를 또 세는 경우)
     if (s.lastCountedSig[key] === endSig) return;
 
     s.lastCountedSig[key] = endSig;
+
+    // ✅ Copilot(4141) 요청이 있었던 생성만 집계
+    const isCopilotThisGen =
+      (s.inFlight?.chatKey === key && s.inFlight?.copilot === true) || wasCopilotRecently();
+
     s.inFlight = null;
-    // ✅ Copilot(4141)일 때만 카운트
-    if (!isCopilot4141()) return;
-    
+
+    if (!isCopilotThisGen) return;
+
     increment();
   }
 
@@ -359,12 +364,8 @@ function isCopilot4141() {
 
     const { eventSource, event_types } = getCtx();
 
-    // ✅ 이 두 개가 프록시/localhost/streaming에서도 제일 안정적으로 잡힘
     if (event_types.GENERATION_STARTED) eventSource.on(event_types.GENERATION_STARTED, onGenStarted);
     if (event_types.GENERATION_ENDED) eventSource.on(event_types.GENERATION_ENDED, onGenEnded);
-
-    // 보험: 렌더 이벤트도 살아있으면 같이 사용해도 되는데,
-    // 지금은 “중복 위험”을 줄이려고 generation 흐름만으로 충분히 구성했어.
   }
 
   main();
