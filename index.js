@@ -5,7 +5,7 @@
 
   const getCtx = () => SillyTavern.getContext();
 
-  // ✅ 한국(로컬) 날짜 기준: 오늘 키
+  // KST/로컬 기준 "오늘"
   function todayKeyLocal() {
     const d = new Date();
     const y = d.getFullYear();
@@ -17,12 +17,17 @@
   function getSettings() {
     const { extensionSettings } = getCtx();
     if (!extensionSettings[MODULE]) {
-      extensionSettings[MODULE] = { total: 0, byDay: {}, lastCounted: {} };
+      extensionSettings[MODULE] = {
+        total: 0,
+        byDay: {},
+        // 중복 방지/판정용
+        inFlight: null,         // { chatKey, startSig }
+        lastCountedSig: {}      // { chatKey: sig }
+      };
     }
     const s = extensionSettings[MODULE];
     if (!s.byDay) s.byDay = {};
-    if (!s.lastCounted) s.lastCounted = {};
-    if (typeof s.total !== "number") s.total = 0;
+    if (!s.lastCountedSig) s.lastCountedSig = {};
     return s;
   }
 
@@ -30,46 +35,75 @@
     getCtx().saveSettingsDebounced();
   }
 
-  // --- 카운트 대상 판정(빈응답/오류 제외) ---
-  function lastAssistant(chat) {
-    for (let i = chat.length - 1; i >= 0; i--) {
-      if (chat[i]?.is_user === false) return chat[i];
-    }
-    return null;
-  }
-
-  function isValidAssistantMessage(msg) {
-    if (!msg) return false;
-    if (typeof msg.mes !== "string") return false;
-    if (msg.mes.trim().length === 0) return false; // 빈 응답 제외
-
-    // 오류 표시(백엔드/버전에 따라 다르니 방어적으로)
-    if (msg.is_error === true) return false;
-    if (msg.error === true) return false;
-    if (typeof msg.error === "string" && msg.error.trim().length > 0) return false;
-
-    // 중복 방지용 기준값
-    if (typeof msg.send_date !== "number") return false;
-    return true;
-  }
-
   function chatKey(ctx) {
     return `${ctx.groupId ?? "nogroup"}:${ctx.characterId ?? "nochar"}`;
   }
 
-  function increment() {
-    const s = getSettings();
-    const t = todayKeyLocal();
-    s.total += 1;
-    s.byDay[t] = (s.byDay[t] ?? 0) + 1;
-    save();
-
-    // 대시보드 열려있으면 즉시 갱신
-    const overlay = document.getElementById(OVERLAY_ID);
-    if (overlay?.getAttribute("data-open") === "1") renderDashboard();
+  // ✅ 메시지 텍스트 필드가 버전/모드마다 달라서, 가능한 후보를 다 본다.
+  function getMsgText(msg) {
+    if (!msg) return "";
+    const candidates = [
+      msg.mes,
+      msg.message,
+      msg.content,
+      msg.text,
+      msg?.data?.mes,
+      msg?.data?.content,
+      msg?.data?.message
+    ];
+    const t = candidates.find(v => typeof v === "string");
+    return t ?? "";
   }
 
-  // --- 최근 N일 ---
+  // ✅ “에러 메시지” 판단도 방어적으로
+  function isErrorLike(msg) {
+    if (!msg) return false;
+    if (msg.is_error === true) return true;
+    if (msg.error === true) return true;
+    if (typeof msg.error === "string" && msg.error.trim().length > 0) return true;
+
+    // 어떤 프록시는 { type: "error" } 같은 걸 넣기도 해서…
+    if (msg.type === "error") return true;
+    if (msg.status === "error") return true;
+    return false;
+  }
+
+  function lastAssistant(chat) {
+    for (let i = chat.length - 1; i >= 0; i--) {
+      const m = chat[i];
+      // staging에서 is_user 대신 role이 들어가는 케이스도 방어
+      if (m?.is_user === false) return m;
+      if (m?.role === "assistant") return m;
+    }
+    return null;
+  }
+
+  // ✅ send_date가 없거나 타입이 달라도 "시그니처"를 만들기
+  // - 시간/아이디가 있으면 포함
+  // - 없으면 텍스트 일부로 대체
+  function signature(msg) {
+    if (!msg) return "none";
+    const t = getMsgText(msg).trim();
+    const time =
+      (typeof msg.send_date === "number" ? msg.send_date : null) ??
+      (typeof msg.send_date === "string" ? msg.send_date : null) ??
+      (typeof msg?.created === "number" ? msg.created : null) ??
+      (typeof msg?.id === "string" ? msg.id : null) ??
+      "";
+    // 텍스트가 너무 길면 앞부분만
+    const head = t.slice(0, 80);
+    return `${String(time)}|${head}`;
+  }
+
+  function isValidAssistant(msg) {
+    if (!msg) return false;
+    if (isErrorLike(msg)) return false;
+    const text = getMsgText(msg);
+    if (typeof text !== "string") return false;
+    if (text.trim().length === 0) return false; // 빈 응답 제외
+    return true;
+  }
+
   function lastNDaysKeysLocal(n = 7) {
     const out = [];
     const base = new Date();
@@ -84,7 +118,7 @@
     return out;
   }
 
-  // --- 대시보드 UI ---
+  // --- Dashboard UI ---
   function ensureDashboard() {
     if (document.getElementById(OVERLAY_ID)) return;
 
@@ -133,7 +167,6 @@
     });
 
     document.body.appendChild(overlay);
-
     document.getElementById("ccCloseBtn").addEventListener("click", closeDashboard);
     document.getElementById("ccCloseBtn2").addEventListener("click", closeDashboard);
 
@@ -142,7 +175,8 @@
       const s = getSettings();
       s.total = 0;
       s.byDay = {};
-      s.lastCounted = {};
+      s.inFlight = null;
+      s.lastCountedSig = {};
       save();
       renderDashboard();
     });
@@ -176,7 +210,6 @@
     keys.forEach((k, idx) => {
       const v = vals[idx];
       const pct = Math.round((v / max) * 100);
-
       const row = document.createElement("div");
       row.className = "ccBarRow";
       row.innerHTML = `
@@ -190,9 +223,8 @@
     document.getElementById("ccBarsHint").textContent = `max ${max}`;
   }
 
-  // --- 🪄 마법봉(Extensions) 메뉴에 항목 주입 ---
+  // --- 🪄 메뉴 주입 ---
   function findWandMenuContainer() {
-    // staging에서 DOM이 바뀌어도 최대한 잡히도록 “가능한 후보를 여러 개”로 탐색
     const candidates = [
       "#extensions_menu",
       "#extensionsMenu",
@@ -200,28 +232,22 @@
       ".extensions-menu",
       ".chatbar_extensions_menu",
       ".chatbar .dropdown-menu",
-      ".chatbar .menu",
       ".chat_controls .dropdown-menu",
-      ".chat-controls .dropdown-menu"
+      ".chat-controls .dropdown-menu",
+      ".dropdown-menu"
     ];
     for (const sel of candidates) {
       const el = document.querySelector(sel);
       if (el) return el;
     }
-
-    // 마지막 보험: “Extensions” 텍스트를 가진 드롭다운을 찾기
-    const dropdowns = Array.from(document.querySelectorAll(".dropdown-menu, .menu, ul"));
-    const hit = dropdowns.find(d => d.textContent?.toLowerCase().includes("extensions"));
-    return hit || null;
+    return null;
   }
 
   function injectWandMenuItem() {
     const menu = findWandMenuContainer();
     if (!menu) return false;
-
     if (menu.querySelector(`#${MENU_ITEM_ID}`)) return true;
 
-    // 메뉴 아이템은 ST 테마마다 li/a/div 형태가 달라서, 최대한 무난한 버튼으로 삽입
     const item = document.createElement("div");
     item.id = MENU_ITEM_ID;
     item.style.padding = "8px 10px";
@@ -242,38 +268,75 @@
     return true;
   }
 
-  function observeForWandMenu() {
-    // 메뉴가 열릴 때마다 DOM이 생성/갱신될 수 있어서, 변화 감지해서 주입
-    const mo = new MutationObserver(() => {
-      injectWandMenuItem();
-    });
+  function observeForMenu() {
+    const mo = new MutationObserver(() => injectWandMenuItem());
     mo.observe(document.body, { childList: true, subtree: true });
   }
 
-  // --- 이벤트로 “정상 답변” 카운트 ---
-  function onAssistantRendered() {
+  // --- ✅ 카운트 로직: GENERATION_STARTED / GENERATION_ENDED ---
+  function onGenStarted() {
     const c = getCtx();
     const s = getSettings();
-    const msg = lastAssistant(c.chat ?? []);
-    if (!isValidAssistantMessage(msg)) return;
-
     const key = chatKey(c);
-    if (s.lastCounted[key] === msg.send_date) return; // 중복 방지
+    const msg = lastAssistant(c.chat ?? []);
+    s.inFlight = { chatKey: key, startSig: signature(msg) };
+    save();
+  }
 
-    s.lastCounted[key] = msg.send_date;
+  function increment() {
+    const s = getSettings();
+    const t = todayKeyLocal();
+    s.total += 1;
+    s.byDay[t] = (s.byDay[t] ?? 0) + 1;
+    save();
+
+    const overlay = document.getElementById(OVERLAY_ID);
+    if (overlay?.getAttribute("data-open") === "1") renderDashboard();
+  }
+
+  function onGenEnded(payload) {
+    const c = getCtx();
+    const s = getSettings();
+    const key = chatKey(c);
+
+    // 에러로 끝난 경우가 payload에 잡히면 제외(없어도 아래 검증이 막아줌)
+    const endedWithError =
+      payload?.is_error === true ||
+      payload?.error === true ||
+      (typeof payload?.error === "string" && payload.error.trim().length > 0);
+
+    if (endedWithError) return;
+
+    const msg = lastAssistant(c.chat ?? []);
+    if (!isValidAssistant(msg)) return;
+
+    const endSig = signature(msg);
+    const startSig = s.inFlight?.chatKey === key ? s.inFlight.startSig : null;
+
+    // 시작과 동일한 메시지면 “새 답변이 추가되지 않음”
+    if (startSig && endSig === startSig) return;
+
+    // 중복 방지 (같은 endSig를 또 세는 경우)
+    if (s.lastCountedSig[key] === endSig) return;
+
+    s.lastCountedSig[key] = endSig;
+    s.inFlight = null;
     increment();
   }
 
   function main() {
     ensureDashboard();
-
-    // 이벤트 훅 + DOM 관찰
-    const { eventSource, event_types } = getCtx();
-    eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, onAssistantRendered);
-
-    // 마법봉 메뉴 항목 삽입(초기 1회 + 변경 감지)
     injectWandMenuItem();
-    observeForWandMenu();
+    observeForMenu();
+
+    const { eventSource, event_types } = getCtx();
+
+    // ✅ 이 두 개가 프록시/localhost/streaming에서도 제일 안정적으로 잡힘
+    if (event_types.GENERATION_STARTED) eventSource.on(event_types.GENERATION_STARTED, onGenStarted);
+    if (event_types.GENERATION_ENDED) eventSource.on(event_types.GENERATION_ENDED, onGenEnded);
+
+    // 보험: 렌더 이벤트도 살아있으면 같이 사용해도 되는데,
+    // 지금은 “중복 위험”을 줄이려고 generation 흐름만으로 충분히 구성했어.
   }
 
   main();
