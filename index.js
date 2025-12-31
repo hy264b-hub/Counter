@@ -115,6 +115,56 @@
   return { ok: false, where: "dom:not-selected", value: "" };
 }
 
+  function getCurrentChatCompletionSource() {
+  const c = getCtx();
+
+  // context에서 흔히 쓰는 후보 키들
+  const candidates = [
+    c?.chat_completion_source,
+    c?.settings?.chat_completion_source,
+    c?.settings?.chatCompletionSource,
+    c?.chatCompletionSource,
+    c?.settings?.main_api,
+    c?.main_api,
+  ];
+
+  const v1 = candidates.find(v => typeof v === "string");
+  if (v1) return v1.toLowerCase();
+
+  // DOM에 select로 있는 경우(설정 패널 열릴 때만 존재할 수 있음)
+  const selects = Array.from(document.querySelectorAll("select"));
+  for (const sel of selects) {
+    const val = (sel?.value ?? "").toString().toLowerCase();
+    if (!val) continue;
+    if (val.includes("openai") || val.includes("google") || val.includes("gemini") || val.includes("openrouter")) {
+      return val;
+    }
+  }
+
+  return "";
+}
+
+function isCopilotSourceSelected() {
+  const src = getCurrentChatCompletionSource();
+  if (!src) return false;
+
+  const isOpenAIish =
+    src.includes("openai") ||
+    src.includes("oai") ||
+    src.includes("openai-compatible") ||
+    src.includes("openai compatible") ||
+    src.includes("chat completion");
+
+  const isGoogleish =
+    src.includes("google") || src.includes("gemini") || src.includes("ai studio");
+
+  const isOpenRouterish = src.includes("openrouter");
+
+  // Copilot을 OpenAI-compatible 계열로 정의하고, Google/OpenRouter는 제외
+  return isOpenAIish && !isGoogleish && !isOpenRouterish;
+}
+
+
 
   // =========================
   // 2) 날짜/저장
@@ -400,6 +450,9 @@
 
     // Copilot(4141) 아닐 때는 카운트 안 함
     if (!det.ok) return;
+
+    if (!isCopilotSourceSelected()) return;
+
 
     const isAssistant =
       (msg?.is_user === false) ||
