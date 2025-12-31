@@ -6,260 +6,98 @@
   const getCtx = () => SillyTavern.getContext();
 
   // =========================
-// 요청 단에서 "이번 생성이 Copilot인지" 태깅하기
-// - ST UI -> ST 서버로 보내는 fetch의 body에 source 정보가 들어있음
-// =========================
-let lastRequestTag = "";     // "copilot" | "google" | "other"
-let lastRequestAt = 0;
-const TAG_WINDOW_MS = 2 * 60 * 1000; // 2분 안에 들어온 응답만 해당 요청으로 간주
-
-function tagFromBodyText(t) {
-  const s = (t || "").toLowerCase();
-
-  // Google 쪽 키워드
-  if (s.includes("google") || s.includes("gemini") || s.includes("ai studio")) return "google";
-
-  // OpenAI-compatible 쪽 키워드(너는 Copilot을 여기로 쓰고 있음)
-  if (
-    s.includes("openai") ||
-    s.includes("openai-compatible") ||
-    s.includes("openai compatible") ||
-    s.includes("chat completion") ||
-    s.includes("chat_completion_source")
-  ) {
-    // 여기서 4141도 같이 확인하면 더 안전
-    if (s.includes("localhost:4141") || s.includes("127.0.0.1:4141") || s.includes("0.0.0.0:4141") || s.includes(":4141")) {
-      return "copilot";
-    }
-    return "other";
-  }
-
-  // 4141이 직접 들어간 바디면 Copilot로 치기
-  if (s.includes("localhost:4141") || s.includes("127.0.0.1:4141") || s.includes("0.0.0.0:4141") || s.includes(":4141")) {
-    return "copilot";
-  }
-
-  return "";
-}
-
-(function hookFetchForTagging() {
-  if (window.__ccTaggedFetchHooked) return;
-  window.__ccTaggedFetchHooked = true;
-
-  const origFetch = window.fetch.bind(window);
-
-  window.fetch = async (...args) => {
-    try {
-      const input = args[0];
-      const init = args[1] || {};
-      const url =
-        (typeof input === "string" && input) ||
-        (input && typeof input.url === "string" && input.url) ||
-        "";
-
-      // ST 내부 API로 보내는 요청에 body가 실리는 경우가 많음
-      const body = init?.body;
-
-      // body가 string이면 바로, 아니면 무시(스트림/바이너리 등)
-      if (typeof body === "string") {
-        const tag = tagFromBodyText(body);
-        if (tag) {
-          lastRequestTag = tag;
-          lastRequestAt = Date.now();
-        }
-      } else if (body && typeof body === "object" && !(body instanceof FormData)) {
-        // 가끔 object로 들어오는 케이스 방어 (대부분은 string이지만)
-        try {
-          const txt = JSON.stringify(body);
-          const tag = tagFromBodyText(txt);
-          if (tag) {
-            lastRequestTag = tag;
-            lastRequestAt = Date.now();
-          }
-        } catch (_) {}
-      }
-
-      // (보험) url 자체에 단서가 있는 경우도 있을 수 있어 저장
-      if (typeof url === "string" && url) {
-        const tag = tagFromBodyText(url);
-        if (tag) {
-          lastRequestTag = tag;
-          lastRequestAt = Date.now();
-        }
-      }
-    } catch (_) {}
-
-    return origFetch(...args);
-  };
-})();
-
-function isRecentCopilotRequest() {
-  if (!lastRequestTag) return false;
-  if ((Date.now() - lastRequestAt) > TAG_WINDOW_MS) return false;
-  return lastRequestTag === "copilot";
-}
-
-
+  // 요청 단에서 "이번 생성이 Copilot인지" 태깅하기 (Request까지 읽는 버전)
   // =========================
-  // 1) Copilot(4141) 판별 (절대 안 죽는 버전)
-  // - DOM input이 없어도 OK
-  // - getContext 어디에 숨어 있어도 OK (얕은 탐색)
-  // - localStorage에 저장돼 있어도 OK
-  // =========================
-  const COPILOT_NEEDLES = ["localhost:4141", "127.0.0.1:4141", "0.0.0.0:4141", ":4141/v1", ":4141"];
+  let lastRequestTag = "";     // "copilot" | "google" | "other" | ""
+  let lastRequestAt = 0;
+  const TAG_WINDOW_MS = 2 * 60 * 1000; // 2분
 
-  function includes4141(s) {
-    if (typeof s !== "string") return false;
-    const v = s.toLowerCase();
-    return COPILOT_NEEDLES.some(n => v.includes(n));
+  function setTag(tag) {
+    lastRequestTag = tag;
+    lastRequestAt = Date.now();
   }
 
-  function searchObjectForNeedle(obj, maxDepth = 4) {
-    // { found: boolean, path: string, value: string }
-    const seen = new Set();
+  function tagFromBodyText(t) {
+    const s = (t || "").toLowerCase();
 
-    function walk(node, path, depth) {
-      if (depth > maxDepth) return null;
-      if (!node || typeof node !== "object") return null;
-      if (seen.has(node)) return null;
-      seen.add(node);
+    // ✅ Google 우선(구글 흔적 있으면 무조건 google)
+    if (s.includes("google") || s.includes("gemini") || s.includes("ai studio")) return "google";
 
-      // 문자열 직접 체크
-      if (typeof node === "string") {
-        if (includes4141(node)) return { found: true, path, value: node };
-        return null;
-      }
+    // ✅ Copilot(4141) 흔적 있으면 copilot
+    if (
+      s.includes("localhost:4141") ||
+      s.includes("127.0.0.1:4141") ||
+      s.includes("0.0.0.0:4141") ||
+      s.includes(":4141/v1") ||
+      s.includes("localhost:4141/v1") ||
+      s.includes("127.0.0.1:4141/v1") ||
+      s.includes("0.0.0.0:4141/v1")
+    ) return "copilot";
 
-      // 배열/객체 순회
-      const entries = Array.isArray(node)
-        ? node.map((v, i) => [String(i), v])
-        : Object.entries(node);
+    // OpenAI-ish 흔적은 other로만(4141 없으면 copilot 확정 불가)
+    if (
+      s.includes("openai") ||
+      s.includes("openai-compatible") ||
+      s.includes("openai compatible") ||
+      s.includes("chat completion") ||
+      s.includes("chat_completion_source")
+    ) return "other";
 
-      for (const [k, v] of entries) {
-        if (typeof v === "string" && includes4141(v)) {
-          return { found: true, path: path ? `${path}.${k}` : k, value: v };
-        }
-        if (v && typeof v === "object") {
-          const res = walk(v, path ? `${path}.${k}` : k, depth + 1);
-          if (res) return res;
-        }
-      }
-      return null;
-    }
-
-    return walk(obj, "", 0);
+    return "";
   }
 
-  function searchLocalStorageForNeedle() {
-    try {
-      // 너무 많이 돌면 느려질 수 있어서 제한
-      const keys = Object.keys(localStorage || {}).slice(0, 50);
-      for (const k of keys) {
-        const raw = localStorage.getItem(k);
-        if (!raw) continue;
-        if (includes4141(raw)) return { found: true, key: k, value: raw.slice(0, 200) };
+  (function hookFetchForTagging() {
+    if (window.__ccTaggedFetchHooked_v2) return;
+    window.__ccTaggedFetchHooked_v2 = true;
 
-        // JSON이면 파싱해서 더 정확히
-        if (raw.startsWith("{") || raw.startsWith("[")) {
+    const origFetch = window.fetch.bind(window);
+
+    window.fetch = async (...args) => {
+      try {
+        const input = args[0];
+        const init = args[1] || {};
+
+        // 1) URL에서도 단서가 있을 수 있음
+        const url =
+          (typeof input === "string" && input) ||
+          (input && typeof input.url === "string" && input.url) ||
+          "";
+        if (typeof url === "string" && url) {
+          const tag = tagFromBodyText(url);
+          if (tag) setTag(tag);
+        }
+
+        // 2) init.body가 string인 경우
+        const body = init?.body;
+        if (typeof body === "string") {
+          const tag = tagFromBodyText(body);
+          if (tag) setTag(tag);
+        } else if (body && typeof body === "object" && !(body instanceof FormData)) {
           try {
-            const obj = JSON.parse(raw);
-            const res = searchObjectForNeedle(obj, 4);
-            if (res?.found) return { found: true, key: k, path: res.path, value: res.value };
+            const txt = JSON.stringify(body);
+            const tag = tagFromBodyText(txt);
+            if (tag) setTag(tag);
           } catch (_) {}
         }
-      }
-    } catch (_) {}
-    return null;
+
+        // 3) ✅ 핵심: input이 Request 객체인 경우 → clone().text()로 body 읽기
+        if (input instanceof Request) {
+          input.clone().text().then((txt) => {
+            const tag = tagFromBodyText(txt);
+            if (tag) setTag(tag);
+          }).catch(() => {});
+        }
+      } catch (_) {}
+
+      return origFetch(...args);
+    };
+  })();
+
+  function isRecentCopilotRequest() {
+    if (!lastRequestTag) return false;
+    if ((Date.now() - lastRequestAt) > TAG_WINDOW_MS) return false;
+    return lastRequestTag === "copilot";
   }
-
-  function detectCopilot4141() {
-  // ✅ "현재 선택된 Custom Endpoint"만 보고 판정한다.
-  // - context/localStorage는 과거 기록이 남아서 오탐 발생 → 사용하지 않음
-  // - Copilot일 때 Custom Endpoint에 http://localhost:4141/v1 이 들어간다고 했으니
-  //   '현재 input value'에서만 4141을 찾는다.
-
-  const needles = ["localhost:4141", "127.0.0.1:4141", "0.0.0.0:4141"];
-
-  // input 후보 중 "URL처럼 보이는 값"만 대상으로 한다(키/프롬프트 input 오탐 방지)
-  const inputs = Array.from(document.querySelectorAll("input"));
-  for (const el of inputs) {
-    const v = (el?.value ?? "").toString().toLowerCase().trim();
-    if (!v) continue;
-
-    const looksLikeEndpoint =
-      v.startsWith("http://") ||
-      v.startsWith("https://") ||
-      v.includes("/v1");
-
-    if (!looksLikeEndpoint) continue;
-
-    if (needles.some(n => v.includes(n))) {
-      return { ok: true, where: "dom:current-endpoint", value: v };
-    }
-  }
-
-  // (보험) 설정 UI가 접혀서 input이 DOM에 없을 때:
-  // 화면 텍스트에 endpoint 문자열이 "현재값"으로 표시되는 경우만 제한적으로 탐지
-  const txt = (document.body?.innerText ?? "").toLowerCase();
-  const hasNeedle = needles.some(n => txt.includes(n));
-  const mentionsEndpoint = txt.includes("custom endpoint") || txt.includes("endpoint");
-  if (hasNeedle && mentionsEndpoint) {
-    return { ok: true, where: "dom:text-endpoint", value: "bodyText" };
-  }
-
-  return { ok: false, where: "dom:not-selected", value: "" };
-}
-
-  function getCurrentChatCompletionSource() {
-  const c = getCtx();
-
-  // context에서 흔히 쓰는 후보 키들
-  const candidates = [
-    c?.chat_completion_source,
-    c?.settings?.chat_completion_source,
-    c?.settings?.chatCompletionSource,
-    c?.chatCompletionSource,
-    c?.settings?.main_api,
-    c?.main_api,
-  ];
-
-  const v1 = candidates.find(v => typeof v === "string");
-  if (v1) return v1.toLowerCase();
-
-  // DOM에 select로 있는 경우(설정 패널 열릴 때만 존재할 수 있음)
-  const selects = Array.from(document.querySelectorAll("select"));
-  for (const sel of selects) {
-    const val = (sel?.value ?? "").toString().toLowerCase();
-    if (!val) continue;
-    if (val.includes("openai") || val.includes("google") || val.includes("gemini") || val.includes("openrouter")) {
-      return val;
-    }
-  }
-
-  return "";
-}
-
-function isCopilotSourceSelected() {
-  const src = getCurrentChatCompletionSource();
-  if (!src) return false;
-
-  const isOpenAIish =
-    src.includes("openai") ||
-    src.includes("oai") ||
-    src.includes("openai-compatible") ||
-    src.includes("openai compatible") ||
-    src.includes("chat completion");
-
-  const isGoogleish =
-    src.includes("google") || src.includes("gemini") || src.includes("ai studio");
-
-  const isOpenRouterish = src.includes("openrouter");
-
-  // Copilot을 OpenAI-compatible 계열로 정의하고, Google/OpenRouter는 제외
-  return isOpenAIish && !isGoogleish && !isOpenRouterish;
-}
-
-
 
   // =========================
   // 2) 날짜/저장
@@ -387,7 +225,7 @@ function isCopilotSourceSelected() {
             <div id="ccBarsList"></div>
           </div>
 
-          <!-- 디버그: 폰이라 콘솔 못 볼 때 여기서 확인 -->
+          <!-- 디버그: 필요 없으면 UI에서만 보이게 놔둬도 됨 -->
           <div class="ccCard" style="padding:10px;border-radius:14px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04)">
             <div class="ccLabel">상태</div>
             <div class="ccSmall" id="ccDebugLine">—</div>
@@ -463,7 +301,8 @@ function isCopilotSourceSelected() {
 
     const dbg = document.getElementById("ccDebugLine");
     if (dbg) {
-      dbg.textContent = `event=${s.debug?.lastEvent || "-"} / copilot=${s.debug?.lastCopilotDetect || "-"}`;
+      // 태깅 상태를 간단히 노출(원하면 나중에 제거 가능)
+      dbg.textContent = `tag=${lastRequestTag || "-"} / age=${lastRequestAt ? (Math.floor((Date.now()-lastRequestAt)/1000)+"s") : "-"}`;
     }
   }
 
@@ -520,10 +359,7 @@ function isCopilotSourceSelected() {
   }
 
   // =========================
-  // 6) 집계: 여러 이벤트를 동시에 구독해서 "절대 안 죽게"
-  // - 어떤 환경은 MESSAGE_RECEIVED만 뜨고
-  // - 어떤 환경은 GENERATION_ENDED만 뜨고
-  // - 어떤 환경은 CHARACTER_MESSAGE_RENDERED만 뜸
+  // 6) 집계
   // =========================
   function increment() {
     const s = getSettings();
@@ -539,16 +375,10 @@ function isCopilotSourceSelected() {
   function tryCountFromMessage(msg, eventName) {
     const s = getSettings();
     s.debug.lastEvent = eventName || "";
-    const det = detectCopilot4141();
-    s.debug.lastCopilotDetect = det.ok ? `YES (${det.where})` : `NO (${det.where})`;
     save();
 
-    // ✅ "이번 응답이 Copilot 요청의 결과"일 때만 카운트
-// (Google로 요청했으면 lastRequestTag가 google로 찍혀서 걸러짐)
-if (!isRecentCopilotRequest()) return;
-
-    if (!isCopilotSourceSelected()) return;
-
+    // ✅ Copilot 요청의 결과일 때만 카운트
+    if (!isRecentCopilotRequest()) return;
 
     const isAssistant =
       (msg?.is_user === false) ||
@@ -576,7 +406,6 @@ if (!isRecentCopilotRequest()) return;
   }
 
   function onCharacterRendered() {
-    // context.chat에서 마지막 assistant를 뽑는 방식 (payload가 없을 때)
     const c = getCtx();
     const chat = c.chat ?? [];
     for (let i = chat.length - 1; i >= 0; i--) {
@@ -589,7 +418,6 @@ if (!isRecentCopilotRequest()) return;
   }
 
   function onGenEnded(payload) {
-    // generation 종료 시점에 마지막 assistant를 채팅에서 뽑아 카운트
     const c = getCtx();
     const chat = c.chat ?? [];
     for (let i = chat.length - 1; i >= 0; i--) {
@@ -608,7 +436,6 @@ if (!isRecentCopilotRequest()) return;
 
     const { eventSource, event_types } = getCtx();
 
-    // 다 잡아둠 (안 뜨는 건 무시됨)
     if (event_types?.MESSAGE_RECEIVED) eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
     if (event_types?.CHARACTER_MESSAGE_RENDERED) eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, onCharacterRendered);
     if (event_types?.GENERATION_ENDED) eventSource.on(event_types.GENERATION_ENDED, onGenEnded);
