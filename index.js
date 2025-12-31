@@ -6,150 +6,124 @@
   const getCtx = () => SillyTavern.getContext();
 
   // =========================
-  // 개선된 요청 추적 시스템
+  // 단순화된 감지: 마지막 요청 타입만 추적
   // =========================
-  const pendingRequests = new Map(); // requestId -> { tag, timestamp }
-  let requestIdCounter = 0;
+  let lastApiType = "";
+  let lastApiTime = 0;
+  const API_WINDOW_MS = 10 * 1000; // 10초
 
-  function generateRequestId() {
-    return `req_${Date.now()}_${++requestIdCounter}`;
+  function setApiType(type) {
+    lastApiType = type;
+    lastApiTime = Date.now();
+    console.log(`[CopilotCounter] API 타입 설정: ${type}`);
   }
 
-  // URL이나 본문에서 Copilot/Google 여부를 더 정확하게 판단
-  function detectApiType(url, bodyText) {
-    const urlLower = (url || "").toLowerCase();
-    const bodyLower = (bodyText || "").toLowerCase();
-    const combined = urlLower + " " + bodyLower;
+  function isRecentCopilot() {
+    const elapsed = Date.now() - lastApiTime;
+    const result = lastApiType === "copilot" && elapsed < API_WINDOW_MS;
+    console.log(`[CopilotCounter] Copilot 체크: type=${lastApiType}, elapsed=${elapsed}ms, result=${result}`);
+    return result;
+  }
 
-    // 1순위: URL에서 직접 판단 (가장 확실함)
-    if (urlLower.includes(":4141")) return "copilot";
-    if (urlLower.includes("localhost:4141") || urlLower.includes("127.0.0.1:4141") || urlLower.includes("0.0.0.0:4141")) {
-      return "copilot";
-    }
-    
-    if (urlLower.includes("generativelanguage.googleapis.com") || 
-        urlLower.includes("ai.google.dev") ||
-        urlLower.includes("aistudio.google.com")) {
-      return "google";
-    }
+  // URL과 본문에서 API 타입 감지
+  function detectFromText(text) {
+    if (!text) return "";
+    const lower = text.toLowerCase();
 
-    // 2순위: 본문에서 판단
-    if (bodyLower.includes("localhost:4141") || 
-        bodyLower.includes("127.0.0.1:4141") || 
-        bodyLower.includes("0.0.0.0:4141") ||
-        bodyLower.includes(":4141/v1")) {
+    // Copilot (localhost:4141)
+    if (lower.includes("localhost:4141") || 
+        lower.includes("127.0.0.1:4141") || 
+        lower.includes(":4141")) {
       return "copilot";
     }
 
-    if (bodyLower.includes("google") || 
-        bodyLower.includes("gemini") || 
-        bodyLower.includes("generativelanguage")) {
+    // Google AI Studio
+    if (lower.includes("generativelanguage.googleapis.com") ||
+        lower.includes("google") ||
+        lower.includes("gemini")) {
       return "google";
     }
 
-    // OpenAI-compatible이지만 4141이 아니면 other
-    if (bodyLower.includes("openai") || combined.includes("/v1/chat/completions")) {
-      return "other";
-    }
-
-    return "unknown";
+    return "";
   }
 
-  // Fetch 후킹 - 요청을 추적
-  (function hookFetchForTracking() {
-    if (window.__ccFetchHooked_v3) return;
-    window.__ccFetchHooked_v3 = true;
+  // =========================
+  // XMLHttpRequest 후킹 추가
+  // =========================
+  (function hookXHR() {
+    if (window.__ccXHRHooked) return;
+    window.__ccXHRHooked = true;
 
-    const origFetch = window.fetch.bind(window);
+    const origOpen = XMLHttpRequest.prototype.open;
+    const origSend = XMLHttpRequest.prototype.send;
+
+    XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+      this.__ccUrl = url;
+      console.log(`[CopilotCounter] XHR open: ${url}`);
+      
+      const type = detectFromText(url);
+      if (type) setApiType(type);
+      
+      return origOpen.call(this, method, url, ...rest);
+    };
+
+    XMLHttpRequest.prototype.send = function(body) {
+      if (body) {
+        console.log(`[CopilotCounter] XHR send body:`, body);
+        const type = detectFromText(body);
+        if (type) setApiType(type);
+      }
+      
+      const type = detectFromText(this.__ccUrl);
+      if (type) setApiType(type);
+      
+      return origSend.call(this, body);
+    };
+  })();
+
+  // =========================
+  // Fetch 후킹
+  // =========================
+  (function hookFetch() {
+    if (window.__ccFetchHooked) return;
+    window.__ccFetchHooked = true;
+
+    const origFetch = window.fetch;
 
     window.fetch = async function(...args) {
-      const requestId = generateRequestId();
-      let apiType = "unknown";
-
       try {
         const input = args[0];
         const init = args[1] || {};
 
-        // URL 추출
+        // URL 체크
         let url = "";
         if (typeof input === "string") {
           url = input;
-        } else if (input instanceof Request) {
-          url = input.url;
         } else if (input?.url) {
           url = input.url;
         }
 
-        // Body 추출 시도 (동기적으로 가능한 것만)
-        let bodyText = "";
-        if (init?.body) {
-          if (typeof init.body === "string") {
-            bodyText = init.body;
-          } else if (init.body && typeof init.body === "object" && !(init.body instanceof FormData)) {
-            try {
-              bodyText = JSON.stringify(init.body);
-            } catch (_) {}
-          }
-        }
+        console.log(`[CopilotCounter] Fetch URL: ${url}`);
+        let type = detectFromText(url);
+        if (type) setApiType(type);
 
-        // API 타입 감지
-        apiType = detectApiType(url, bodyText);
-
-        // 채팅 완성 요청으로 보이는 경우만 추적
-        const isChatRequest = 
-          url.includes("/chat/completions") || 
-          url.includes("/v1/messages") ||
-          bodyText.includes("messages") ||
-          bodyText.includes("prompt");
-
-        if (isChatRequest && apiType !== "unknown") {
-          pendingRequests.set(requestId, {
-            tag: apiType,
-            timestamp: Date.now(),
-            url: url
-          });
-
-          // 5분 후 자동 정리
-          setTimeout(() => {
-            pendingRequests.delete(requestId);
-          }, 5 * 60 * 1000);
+        // Body 체크
+        if (init.body) {
+          const bodyStr = typeof init.body === "string" ? init.body : JSON.stringify(init.body);
+          console.log(`[CopilotCounter] Fetch body:`, bodyStr.slice(0, 200));
+          const bodyType = detectFromText(bodyStr);
+          if (bodyType) setApiType(bodyType);
         }
       } catch (err) {
         console.error("[CopilotCounter] Fetch hook error:", err);
       }
 
-      // 원본 fetch 실행 후 requestId를 응답에 태깅
-      const response = await origFetch(...args);
-      
-      // 응답 객체에 requestId 저장 (나중에 매칭할 수 있도록)
-      if (response && pendingRequests.has(requestId)) {
-        response.__ccRequestId = requestId;
-      }
-
-      return response;
+      return origFetch.apply(this, args);
     };
   })();
 
-  // 가장 최근 Copilot 요청인지 확인 (5초 이내)
-  function getRecentCopilotRequest() {
-    const now = Date.now();
-    let mostRecent = null;
-    let mostRecentTime = 0;
-
-    for (const [id, data] of pendingRequests.entries()) {
-      if (data.tag === "copilot" && (now - data.timestamp) < 5000) {
-        if (data.timestamp > mostRecentTime) {
-          mostRecent = { id, ...data };
-          mostRecentTime = data.timestamp;
-        }
-      }
-    }
-
-    return mostRecent;
-  }
-
   // =========================
-  // 날짜/저장
+  // 저장/설정
   // =========================
   function todayKeyLocal() {
     const d = new Date();
@@ -169,15 +143,14 @@
         debug: {
           lastEvent: "",
           lastApiType: "",
-          lastTimestamp: ""
+          lastCheck: ""
         }
       };
     }
     const s = extensionSettings[MODULE];
     if (!s.byDay) s.byDay = {};
     if (typeof s.total !== "number") s.total = 0;
-    if (typeof s.lastSig !== "string") s.lastSig = "";
-    if (!s.debug) s.debug = { lastEvent: "", lastApiType: "", lastTimestamp: "" };
+    if (!s.debug) s.debug = { lastEvent: "", lastApiType: "", lastCheck: "" };
     return s;
   }
 
@@ -186,7 +159,7 @@
   }
 
   // =========================
-  // 메시지 파싱/유효성
+  // 메시지 파싱
   // =========================
   function getMsgText(msg) {
     if (!msg) return "";
@@ -196,35 +169,26 @@
       msg.content,
       msg.text,
       msg?.data?.mes,
-      msg?.data?.content,
-      msg?.data?.message
+      msg?.data?.content
     ];
-    const t = candidates.find(v => typeof v === "string");
-    return t ?? "";
+    return candidates.find(v => typeof v === "string") ?? "";
   }
 
   function isErrorLike(msg) {
     if (!msg) return false;
-    if (msg.is_error === true) return true;
-    if (msg.error === true) return true;
-    if (typeof msg.error === "string" && msg.error.trim().length > 0) return true;
-    if (msg.type === "error") return true;
-    if (msg.status === "error") return true;
-    return false;
+    return msg.is_error === true || 
+           msg.error === true || 
+           (typeof msg.error === "string" && msg.error.trim().length > 0);
   }
 
   function signatureFromMessage(msg) {
     const text = getMsgText(msg).trim();
-    const time =
-      (typeof msg?.send_date === "number" ? String(msg.send_date) : "") ||
-      (typeof msg?.created === "number" ? String(msg.created) : "") ||
-      (typeof msg?.id === "string" ? msg.id : "");
-    const head = text.slice(0, 80);
-    return `${time}|${head}`;
+    const time = String(msg?.send_date || msg?.created || msg?.id || "");
+    return `${time}|${text.slice(0, 80)}`;
   }
 
   // =========================
-  // UI (대시보드)
+  // UI
   // =========================
   function lastNDaysKeysLocal(n = 7) {
     const out = [];
@@ -375,6 +339,15 @@
         .ccBtn.danger:hover {
           background: rgba(220,38,38,0.3);
         }
+        .ccDebugBox {
+          background: rgba(0,0,0,0.3);
+          border: 1px solid rgba(255,255,255,0.1);
+          border-radius: 8px;
+          padding: 12px;
+          font-family: monospace;
+          font-size: 0.8em;
+          line-height: 1.6;
+        }
       </style>
       <div id="ccModal" role="dialog" aria-modal="true">
         <header>
@@ -392,7 +365,7 @@
             <div class="ccCard">
               <div class="ccLabel">전체</div>
               <div class="ccValue" id="ccDashTotal">0</div>
-              <div class="ccSmall">Copilot 응답만</div>
+              <div class="ccSmall">Copilot만</div>
             </div>
           </div>
 
@@ -404,9 +377,9 @@
             <div id="ccBarsList"></div>
           </div>
 
-          <div class="ccCard">
-            <div class="ccLabel">디버그 정보</div>
-            <div class="ccSmall" id="ccDebugLine" style="font-family: monospace;">—</div>
+          <div class="ccDebugBox" id="ccDebugBox">
+            <div><strong>디버그 정보:</strong></div>
+            <div id="ccDebugLine">—</div>
           </div>
         </div>
 
@@ -431,7 +404,7 @@
       s.total = 0;
       s.byDay = {};
       s.lastSig = "";
-      s.debug = { lastEvent: "", lastApiType: "", lastTimestamp: "" };
+      s.debug = { lastEvent: "", lastApiType: "", lastCheck: "" };
       save();
       renderDashboard();
     });
@@ -479,25 +452,24 @@
 
     const dbg = document.getElementById("ccDebugLine");
     if (dbg) {
-      const pending = Array.from(pendingRequests.values()).filter(r => r.tag === "copilot");
-      dbg.textContent = `추적 중: ${pending.length}개 | 마지막: ${s.debug.lastApiType || "-"} (${s.debug.lastTimestamp || "-"})`;
+      const elapsed = Date.now() - lastApiTime;
+      dbg.innerHTML = `
+        마지막 API: <strong>${lastApiType || "없음"}</strong><br>
+        경과 시간: ${elapsed}ms (${API_WINDOW_MS}ms 이내여야 함)<br>
+        마지막 이벤트: ${s.debug.lastEvent || "-"}<br>
+        마지막 체크: ${s.debug.lastCheck || "-"}
+      `;
     }
   }
 
   // =========================
-  // 메뉴 주입
+  // 메뉴
   // =========================
   function findWandMenuContainer() {
     const candidates = [
       "#extensions_menu",
       "#extensionsMenu",
-      ".extensions_menu",
-      ".extensions-menu",
-      ".chatbar_extensions_menu",
-      ".chatbar .dropdown-menu",
-      ".chat_controls .dropdown-menu",
-      ".chat-controls .dropdown-menu",
-      ".dropdown-menu"
+      ".extensions_menu"
     ];
     for (const sel of candidates) {
       const el = document.querySelector(sel);
@@ -546,6 +518,7 @@
     const t = todayKeyLocal();
     s.total += 1;
     s.byDay[t] = (s.byDay[t] ?? 0) + 1;
+    console.log(`[CopilotCounter] ✅ 카운트 증가: 오늘=${s.byDay[t]}, 전체=${s.total}`);
     save();
 
     const overlay = document.getElementById(OVERLAY_ID);
@@ -553,40 +526,54 @@
   }
 
   function tryCountFromMessage(msg, eventName) {
+    console.log(`[CopilotCounter] 이벤트: ${eventName}`);
+    
     const s = getSettings();
-    s.debug.lastEvent = eventName || "";
+    s.debug.lastEvent = eventName;
 
-    // Copilot 요청이 최근에 있었는지 확인
-    const recentCopilot = getRecentCopilotRequest();
-    if (!recentCopilot) {
-      s.debug.lastApiType = "no-copilot-request";
+    const isCopilot = isRecentCopilot();
+    s.debug.lastApiType = lastApiType || "없음";
+    s.debug.lastCheck = `${isCopilot ? "✅ Copilot" : "❌ 아님"} (${Date.now() - lastApiTime}ms 전)`;
+    
+    if (!isCopilot) {
+      console.log(`[CopilotCounter] ❌ Copilot 아님: ${lastApiType}`);
       save();
       return;
     }
-
-    s.debug.lastApiType = "copilot";
-    s.debug.lastTimestamp = new Date().toISOString().slice(11, 19);
 
     const isAssistant =
       (msg?.is_user === false) ||
       (msg?.role === "assistant") ||
       (msg?.sender === "assistant");
 
-    if (!isAssistant) return;
-    if (isErrorLike(msg)) return;
+    if (!isAssistant) {
+      console.log("[CopilotCounter] ❌ 어시스턴트 메시지 아님");
+      return;
+    }
+
+    if (isErrorLike(msg)) {
+      console.log("[CopilotCounter] ❌ 에러 메시지");
+      return;
+    }
 
     const text = getMsgText(msg);
-    if (text.trim().length === 0) return;
+    if (text.trim().length === 0) {
+      console.log("[CopilotCounter] ❌ 빈 메시지");
+      return;
+    }
 
     const sig = signatureFromMessage(msg);
-    if (!sig || sig === "none|") return;
+    if (!sig || sig === "none|") {
+      console.log("[CopilotCounter] ❌ 잘못된 시그니처");
+      return;
+    }
 
-    if (s.lastSig === sig) return;
+    if (s.lastSig === sig) {
+      console.log("[CopilotCounter] ❌ 중복 메시지");
+      return;
+    }
+
     s.lastSig = sig;
-
-    // 사용된 요청 삭제
-    pendingRequests.delete(recentCopilot.id);
-
     increment();
     save();
   }
@@ -627,11 +614,17 @@
 
     const { eventSource, event_types } = getCtx();
 
-    if (event_types?.MESSAGE_RECEIVED) eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
-    if (event_types?.CHARACTER_MESSAGE_RENDERED) eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, onCharacterRendered);
-    if (event_types?.GENERATION_ENDED) eventSource.on(event_types.GENERATION_ENDED, onGenEnded);
+    if (event_types?.MESSAGE_RECEIVED) {
+      eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
+    }
+    if (event_types?.CHARACTER_MESSAGE_RENDERED) {
+      eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, onCharacterRendered);
+    }
+    if (event_types?.GENERATION_ENDED) {
+      eventSource.on(event_types.GENERATION_ENDED, onGenEnded);
+    }
 
-    console.log("[CopilotCounter] v3 초기화 완료");
+    console.log("[CopilotCounter] ✅ 초기화 완료 - XHR + Fetch 후킹 활성화");
   }
 
   main();
