@@ -146,19 +146,17 @@
       }
     }
 
-    // 판정
+    // ✅ 판정: 엔드포인트가 4141이면 무조건 Copilot (소스 이름 무시)
     if (copilotEndpoint) {
-      const sourceVal = apiSource?.value.toLowerCase() || "";
-      
-      if (sourceVal.includes("google") || sourceVal.includes("gemini")) {
-        addLog("❌ Google 소스 감지 - Copilot 아님");
-        return { isCopilot: false, reason: "google-source", endpoint: copilotEndpoint.value, source: sourceVal };
-      }
-      
-      if (!apiSource || sourceVal.includes("openai") || sourceVal.includes("custom")) {
-        addLog("✅ Copilot 확정! (OpenAI-compatible + 4141)");
-        return { isCopilot: true, reason: "copilot-confirmed", endpoint: copilotEndpoint.value, source: sourceVal };
-      }
+      const sourceVal = apiSource?.value || "";
+      addLog(`✅ Copilot 확정! (엔드포인트 4141 감지)`);
+      addLog(`  └ 소스: ${sourceVal || "없음"} (Copilot을 통해 접속)`);
+      return { 
+        isCopilot: true, 
+        reason: "copilot-via-4141", 
+        endpoint: copilotEndpoint.value, 
+        source: sourceVal 
+      };
     }
 
     addLog("❌ 4141 엔드포인트 없음 - Copilot 아님");
