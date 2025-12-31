@@ -78,26 +78,43 @@
   }
 
   function detectCopilot4141() {
-    // 1) Context에서 찾기 (설정 패널 열려있지 않아도 가능)
-    const c = getCtx();
-    const resCtx = searchObjectForNeedle(c, 4);
-    if (resCtx?.found) return { ok: true, where: `context:${resCtx.path}`, value: resCtx.value };
+  // ✅ "현재 선택된 Custom Endpoint"만 보고 판정한다.
+  // - context/localStorage는 과거 기록이 남아서 오탐 발생 → 사용하지 않음
+  // - Copilot일 때 Custom Endpoint에 http://localhost:4141/v1 이 들어간다고 했으니
+  //   '현재 input value'에서만 4141을 찾는다.
 
-    // 2) DOM input에서 찾기 (설정 패널 열려있을 때)
-    try {
-      const inputs = Array.from(document.querySelectorAll("input"));
-      for (const el of inputs) {
-        const v = (el?.value ?? "").toString();
-        if (includes4141(v)) return { ok: true, where: "dom:input", value: v };
-      }
-    } catch (_) {}
+  const needles = ["localhost:4141", "127.0.0.1:4141", "0.0.0.0:4141"];
 
-    // 3) localStorage에서 찾기
-    const resLS = searchLocalStorageForNeedle();
-    if (resLS?.found) return { ok: true, where: `localStorage:${resLS.key}${resLS.path ? ":" + resLS.path : ""}`, value: resLS.value };
+  // input 후보 중 "URL처럼 보이는 값"만 대상으로 한다(키/프롬프트 input 오탐 방지)
+  const inputs = Array.from(document.querySelectorAll("input"));
+  for (const el of inputs) {
+    const v = (el?.value ?? "").toString().toLowerCase().trim();
+    if (!v) continue;
 
-    return { ok: false, where: "not-found", value: "" };
+    const looksLikeEndpoint =
+      v.startsWith("http://") ||
+      v.startsWith("https://") ||
+      v.includes("/v1");
+
+    if (!looksLikeEndpoint) continue;
+
+    if (needles.some(n => v.includes(n))) {
+      return { ok: true, where: "dom:current-endpoint", value: v };
+    }
   }
+
+  // (보험) 설정 UI가 접혀서 input이 DOM에 없을 때:
+  // 화면 텍스트에 endpoint 문자열이 "현재값"으로 표시되는 경우만 제한적으로 탐지
+  const txt = (document.body?.innerText ?? "").toLowerCase();
+  const hasNeedle = needles.some(n => txt.includes(n));
+  const mentionsEndpoint = txt.includes("custom endpoint") || txt.includes("endpoint");
+  if (hasNeedle && mentionsEndpoint) {
+    return { ok: true, where: "dom:text-endpoint", value: "bodyText" };
+  }
+
+  return { ok: false, where: "dom:not-selected", value: "" };
+}
+
 
   // =========================
   // 2) 날짜/저장
