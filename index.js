@@ -9,7 +9,7 @@
   // 로그 시스템
   // =========================
   const logs = [];
-  const MAX_LOGS = 30;
+  const MAX_LOGS = 40;
 
   function addLog(msg) {
     const time = new Date().toLocaleTimeString('ko-KR');
@@ -19,167 +19,174 @@
     const logEl = document.getElementById("ccLogs");
     if (logEl) {
       logEl.innerHTML = logs.map(l => `<div>${l}</div>`).join('');
+      logEl.scrollTop = 0;
     }
   }
 
   // =========================
-  // 1) "현재 선택된" 소스/엔드포인트로 Copilot 여부 판정
+  // 광범위한 설정 스캔
   // =========================
-  function norm(s) {
-    return (typeof s === "string" ? s : "").trim();
-  }
+  function deepScan(obj, path = "", maxDepth = 4) {
+    const results = [];
+    if (!obj || typeof obj !== "object" || maxDepth <= 0) return results;
 
-  function getActiveChatCompletionSource() {
-    const c = getCtx();
-
-    const candidates = [
-      c?.chat_completion_source,
-      c?.settings?.chat_completion_source,
-      c?.settings?.chatCompletionSource,
-      c?.chatCompletionSource,
-      c?.settings?.main_api,
-      c?.main_api,
-      c?.settings?.api_source,
-      c?.api_source,
-    ];
-
-    const v = candidates.map(norm).find(Boolean);
-    if (v) {
-      addLog(`📌 소스 발견(ctx): ${v}`);
-      return v.toLowerCase();
-    }
-
-    // DOM select fallback
-    try {
-      const selects = Array.from(document.querySelectorAll("select"));
-      for (const sel of selects) {
-        const val = norm(sel?.value).toLowerCase();
-        if (
-          val.includes("openai") ||
-          val.includes("google") ||
-          val.includes("gemini") ||
-          val.includes("openrouter") ||
-          val.includes("claude") ||
-          val.includes("anthropic")
-        ) {
-          addLog(`📌 소스 발견(DOM): ${val}`);
-          return val;
+    for (const key in obj) {
+      try {
+        const val = obj[key];
+        const newPath = path ? `${path}.${key}` : key;
+        
+        if (typeof val === "string" && val.trim()) {
+          const lower = val.toLowerCase();
+          // URL이나 API 소스처럼 보이는 값만
+          if (
+            lower.includes("localhost") ||
+            lower.includes("127.0.0.1") ||
+            lower.includes(":4141") ||
+            lower.includes("openai") ||
+            lower.includes("google") ||
+            lower.includes("gemini") ||
+            lower.includes("http://") ||
+            lower.includes("https://") ||
+            lower.includes("/v1")
+          ) {
+            results.push({ path: newPath, value: val });
+          }
         }
-      }
-    } catch (_) {}
-
-    addLog("❌ 소스 없음");
-    return "";
-  }
-
-  function getActiveCustomEndpoint() {
-    const c = getCtx();
-
-    const candidates = [
-      c?.settings?.api_url,
-      c?.settings?.apiUrl,
-      c?.api_url,
-      c?.apiUrl,
-      c?.oai_settings?.api_url,
-      c?.oai_settings?.apiUrl,
-      c?.openai_settings?.api_url,
-      c?.openai_settings?.apiUrl,
-      c?.openai_settings?.base_url,
-      c?.openai_settings?.baseUrl,
-      c?.settings?.custom_endpoint,
-      c?.settings?.customEndpoint,
-    ];
-
-    const v = candidates.map(norm).find(Boolean);
-    if (v) {
-      addLog(`🔗 엔드포인트(ctx): ${v}`);
-      return v.toLowerCase();
-    }
-
-    // DOM input fallback
-    try {
-      const inputs = Array.from(document.querySelectorAll("input"));
-      for (const el of inputs) {
-        const vv = norm(el?.value).toLowerCase();
-        if (!vv) continue;
-        const looksLikeUrl = vv.startsWith("http://") || vv.startsWith("https://");
-        if (!looksLikeUrl) continue;
-        if (vv.includes("/v1") || vv.includes("localhost") || vv.includes("127.0.0.1")) {
-          addLog(`🔗 엔드포인트(DOM): ${vv}`);
-          return vv;
+        
+        if (typeof val === "object" && val !== null) {
+          results.push(...deepScan(val, newPath, maxDepth - 1));
         }
-      }
-    } catch (_) {}
-
-    addLog("❌ 엔드포인트 없음");
-    return "";
-  }
-
-  function isCopilotSelectedNow() {
-    addLog("🔍 Copilot 체크 시작...");
+      } catch (_) {}
+    }
     
-    const src = getActiveChatCompletionSource();
-    const endpoint = getActiveCustomEndpoint();
+    return results;
+  }
 
-    const endpointIs4141 =
-      endpoint.includes("localhost:4141") ||
-      endpoint.includes("127.0.0.1:4141") ||
-      endpoint.includes("0.0.0.0:4141") ||
-      endpoint.includes(":4141/") ||
-      endpoint.endsWith(":4141");
+  function scanAllSettings() {
+    addLog("🔍 전체 설정 스캔 시작...");
+    
+    const c = getCtx();
+    const allFindings = [];
 
-    // Google/Gemini 제외
-    const isGoogleish = src.includes("google") || src.includes("gemini") || src.includes("ai studio");
-    if (isGoogleish) {
-      addLog(`❌ Google 감지: ${src}`);
-      return { ok: false, reason: "source=google", src, endpoint };
+    // 1. Context 객체 스캔
+    const ctxResults = deepScan(c, "ctx");
+    allFindings.push(...ctxResults);
+    
+    // 2. window 객체에서 SillyTavern 관련 찾기
+    try {
+      if (window.SillyTavern) {
+        const stResults = deepScan(window.SillyTavern, "ST");
+        allFindings.push(...stResults);
+      }
+    } catch (_) {}
+
+    // 3. DOM에서 찾기
+    try {
+      // Select 태그들
+      document.querySelectorAll("select").forEach((sel, idx) => {
+        const val = sel.value?.trim();
+        if (val) {
+          allFindings.push({ path: `DOM.select[${idx}]`, value: val });
+        }
+      });
+      
+      // Input 태그들 (URL 형태만)
+      document.querySelectorAll("input[type='text'], input[type='url']").forEach((inp, idx) => {
+        const val = inp.value?.trim();
+        if (val && (val.startsWith("http") || val.includes("localhost") || val.includes("127.0.0.1"))) {
+          allFindings.push({ path: `DOM.input[${idx}]`, value: val });
+        }
+      });
+    } catch (_) {}
+
+    // 결과 로깅
+    if (allFindings.length === 0) {
+      addLog("❌ 아무 설정도 찾지 못함");
+    } else {
+      addLog(`📋 총 ${allFindings.length}개 설정 발견:`);
+      allFindings.forEach(f => {
+        const short = f.value.length > 60 ? f.value.slice(0, 60) + "..." : f.value;
+        addLog(`  • ${f.path}: ${short}`);
+      });
     }
 
-    // OpenRouter 제외
-    const isOpenRouter = src.includes("openrouter");
-    if (isOpenRouter) {
-      addLog(`❌ OpenRouter 감지: ${src}`);
-      return { ok: false, reason: "source=openrouter", src, endpoint };
+    return allFindings;
+  }
+
+  function analyzeCopilot(findings) {
+    addLog("🔍 Copilot 분석 시작...");
+    
+    let copilotEndpoint = null;
+    let apiSource = null;
+
+    // 4141 포트 찾기
+    for (const f of findings) {
+      const val = f.value.toLowerCase();
+      if (val.includes(":4141") || val.includes("localhost:4141") || val.includes("127.0.0.1:4141")) {
+        copilotEndpoint = f;
+        addLog(`✅ 4141 엔드포인트 발견: ${f.path}`);
+        break;
+      }
     }
 
-    // Copilot = OpenAI-compatible + 4141
-    const isOpenAIish =
-      src.includes("openai") ||
-      src.includes("oai") ||
-      src.includes("openai-compatible") ||
-      src.includes("openai compatible") ||
-      src.includes("chat completion") ||
-      src.includes("custom");
-
-    if (endpointIs4141 && (isOpenAIish || !src)) {
-      addLog(`✅ Copilot 확정! (${src || "기본"} + 4141)`);
-      return { ok: true, reason: "endpoint=4141", src, endpoint };
+    // API 소스 찾기
+    for (const f of findings) {
+      const val = f.value.toLowerCase();
+      const isSource = 
+        val.includes("openai") || 
+        val.includes("google") || 
+        val.includes("gemini") ||
+        val.includes("claude") ||
+        val.includes("anthropic");
+      
+      if (isSource && !val.includes("http")) {
+        apiSource = f;
+        addLog(`📌 API 소스 발견: ${f.path} = ${f.value}`);
+        break;
+      }
     }
 
-    addLog(`❌ Copilot 아님 (src=${src}, ep=${endpoint.slice(0,40)})`);
-    return { ok: false, reason: "not-4141-or-not-openaiish", src, endpoint };
+    // 판정
+    if (copilotEndpoint) {
+      const sourceVal = apiSource?.value.toLowerCase() || "";
+      
+      if (sourceVal.includes("google") || sourceVal.includes("gemini")) {
+        addLog("❌ Google 소스 감지 - Copilot 아님");
+        return { isCopilot: false, reason: "google-source", endpoint: copilotEndpoint.value, source: sourceVal };
+      }
+      
+      if (!apiSource || sourceVal.includes("openai") || sourceVal.includes("custom")) {
+        addLog("✅ Copilot 확정! (OpenAI-compatible + 4141)");
+        return { isCopilot: true, reason: "copilot-confirmed", endpoint: copilotEndpoint.value, source: sourceVal };
+      }
+    }
+
+    addLog("❌ 4141 엔드포인트 없음 - Copilot 아님");
+    return { isCopilot: false, reason: "no-4141", endpoint: "", source: apiSource?.value || "" };
   }
 
   // =========================
-  // 2) generation 태그
+  // Generation 태그
   // =========================
-  let lastGen = { isCopilot: false, startedAt: 0, src: "", endpoint: "", reason: "" };
-  const GEN_WINDOW_MS = 5 * 60 * 1000; // 5분
+  let lastGen = { isCopilot: false, startedAt: 0, source: "", endpoint: "", reason: "" };
+  const GEN_WINDOW_MS = 5 * 60 * 1000;
 
   function tagGenerationStart() {
-    const det = isCopilotSelectedNow();
+    const findings = scanAllSettings();
+    const result = analyzeCopilot(findings);
+    
     lastGen = {
-      isCopilot: det.ok,
+      isCopilot: result.isCopilot,
       startedAt: Date.now(),
-      src: det.src || "",
-      endpoint: det.endpoint || "",
-      reason: det.reason || ""
+      source: result.source || "",
+      endpoint: result.endpoint || "",
+      reason: result.reason || ""
     };
     
-    if (det.ok) {
-      addLog(`🏷️ Generation 태깅: COPILOT`);
+    if (result.isCopilot) {
+      addLog(`🏷️ Generation: COPILOT`);
     } else {
-      addLog(`🏷️ Generation 태깅: ${det.reason}`);
+      addLog(`🏷️ Generation: ${result.reason}`);
     }
   }
 
@@ -189,7 +196,7 @@
   }
 
   // =========================
-  // 3) 저장/설정
+  // 저장/설정
   // =========================
   function todayKeyLocal() {
     const d = new Date();
@@ -208,7 +215,6 @@
     const s = extensionSettings[MODULE];
     if (!s.byDay) s.byDay = {};
     if (typeof s.total !== "number") s.total = 0;
-    if (typeof s.lastSig !== "string") s.lastSig = "";
     return s;
   }
 
@@ -217,31 +223,17 @@
   }
 
   // =========================
-  // 4) 메시지 파싱
+  // 메시지 파싱
   // =========================
   function getMsgText(msg) {
     if (!msg) return "";
-    const candidates = [
-      msg.mes,
-      msg.message,
-      msg.content,
-      msg.text,
-      msg?.data?.mes,
-      msg?.data?.content,
-      msg?.data?.message
-    ];
+    const candidates = [msg.mes, msg.message, msg.content, msg.text];
     return candidates.find(v => typeof v === "string") ?? "";
   }
 
   function isErrorLike(msg) {
     if (!msg) return false;
-    return (
-      msg.is_error === true ||
-      msg.error === true ||
-      (typeof msg.error === "string" && msg.error.trim().length > 0) ||
-      msg.type === "error" ||
-      msg.status === "error"
-    );
+    return msg.is_error === true || msg.error === true;
   }
 
   function signatureFromMessage(msg) {
@@ -252,15 +244,13 @@
 
   function lastAssistant(chat) {
     for (let i = chat.length - 1; i >= 0; i--) {
-      const m = chat[i];
-      if (m?.is_user === false) return m;
-      if (m?.role === "assistant") return m;
+      if (chat[i]?.is_user === false) return chat[i];
     }
     return null;
   }
 
   // =========================
-  // 5) UI
+  // UI
   // =========================
   function lastNDaysKeysLocal(n = 7) {
     const out = [];
@@ -281,9 +271,9 @@
     overlay.setAttribute("data-open", "0");
     overlay.innerHTML = `
       <style>
-        #${OVERLAY_ID}{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:10000;align-items:center;justify-content:center;padding:10px;}
+        #${OVERLAY_ID}{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:10000;align-items:center;justify-content:center;padding:10px;}
         #${OVERLAY_ID}[data-open="1"]{display:flex;}
-        #ccModal{background:#1e1e1e;border-radius:16px;width:100%;max-width:500px;max-height:90vh;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,0.6);}
+        #ccModal{background:#1e1e1e;border-radius:16px;width:100%;max-width:600px;max-height:90vh;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,0.6);}
         #ccModal header{padding:16px;border-bottom:1px solid rgba(255,255,255,0.1);display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;background:#1e1e1e;z-index:1;}
         #ccModal .title{font-size:1.2em;font-weight:600;}
         #ccModal .body{padding:16px;}
@@ -300,21 +290,22 @@
         .ccBarFill{height:100%;background:linear-gradient(90deg,#4a9eff,#6b5fff);}
         .ccBarNum{width:25px;text-align:right;font-size:0.75em;font-weight:600;}
         .ccSection{background:rgba(255,255,255,0.03);border-radius:12px;padding:12px;margin-bottom:12px;}
-        .ccSectionTitle{font-size:0.9em;font-weight:600;margin-bottom:8px;}
-        #ccStatus{display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:0.75em;margin-bottom:8px;}
-        #ccStatus div{padding:8px;background:rgba(255,255,255,0.05);border-radius:6px;}
-        #ccLogs{background:rgba(0,0,0,0.3);border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:10px;max-height:250px;overflow-y:auto;font-family:monospace;font-size:0.7em;line-height:1.5;}
-        #ccLogs div{padding:2px 0;border-bottom:1px solid rgba(255,255,255,0.05);}
-        #ccModal footer{padding:12px 16px;border-top:1px solid rgba(255,255,255,0.1);display:flex;gap:8px;justify-content:flex-end;position:sticky;bottom:0;background:#1e1e1e;}
-        .ccBtn{padding:8px 14px;border-radius:8px;border:1px solid rgba(255,255,255,0.2);background:rgba(255,255,255,0.1);color:white;cursor:pointer;font-size:0.85em;}
+        .ccSectionTitle{font-size:0.9em;font-weight:600;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;}
+        #ccStatus{display:grid;grid-template-columns:1fr;gap:8px;font-size:0.75em;margin-bottom:8px;}
+        #ccStatus div{padding:8px;background:rgba(255,255,255,0.05);border-radius:6px;word-break:break-all;}
+        #ccLogs{background:rgba(0,0,0,0.4);border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:10px;max-height:300px;overflow-y:auto;font-family:monospace;font-size:0.65em;line-height:1.4;}
+        #ccLogs div{padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.03);}
+        #ccModal footer{padding:12px 16px;border-top:1px solid rgba(255,255,255,0.1);display:flex;gap:8px;justify-content:flex-end;position:sticky;bottom:0;background:#1e1e1e;flex-wrap:wrap;}
+        .ccBtn{padding:8px 14px;border-radius:8px;border:1px solid rgba(255,255,255,0.2);background:rgba(255,255,255,0.1);color:white;cursor:pointer;font-size:0.85em;white-space:nowrap;}
         .ccBtn:active{background:rgba(255,255,255,0.2);}
         .ccBtn.danger{background:rgba(220,38,38,0.2);border-color:rgba(220,38,38,0.4);}
+        .ccBtn.primary{background:rgba(59,130,246,0.3);border-color:rgba(59,130,246,0.5);}
       </style>
 
       <div id="ccModal" role="dialog" aria-modal="true">
         <header>
           <div class="title">🤖 Copilot Counter</div>
-          <button class="ccBtn" id="ccCloseBtn" type="button">✕</button>
+          <button class="ccBtn" id="ccCloseBtn">✕</button>
         </header>
 
         <div class="body">
@@ -333,44 +324,46 @@
 
           <div id="ccBars">
             <div class="barsTitle">
-              <div class="left">최근 7일</div>
-              <div class="right" id="ccBarsHint">—</div>
+              <div>최근 7일</div>
+              <div id="ccBarsHint">—</div>
             </div>
             <div id="ccBarsList"></div>
           </div>
 
           <div class="ccSection">
-            <div class="ccSectionTitle">📊 현재 상태</div>
+            <div class="ccSectionTitle">
+              <span>📊 현재 Generation 상태</span>
+              <span id="ccGenStatus" style="font-size:0.85em;opacity:0.8;">—</span>
+            </div>
             <div id="ccStatus">
               <div>
-                <div style="opacity:0.6;">태그</div>
-                <div id="ccTag" style="font-weight:600;margin-top:4px;">-</div>
+                <div style="opacity:0.7;margin-bottom:4px;">소스</div>
+                <div id="ccSrc" style="font-weight:600;">-</div>
               </div>
               <div>
-                <div style="opacity:0.6;">경과</div>
-                <div id="ccElapsed" style="font-weight:600;margin-top:4px;">-</div>
+                <div style="opacity:0.7;margin-bottom:4px;">엔드포인트</div>
+                <div id="ccEndpoint" style="font-weight:600;">-</div>
               </div>
-              <div style="grid-column:1/-1;">
-                <div style="opacity:0.6;">소스</div>
-                <div id="ccSrc" style="font-weight:600;margin-top:4px;word-break:break-all;">-</div>
-              </div>
-              <div style="grid-column:1/-1;">
-                <div style="opacity:0.6;">엔드포인트</div>
-                <div id="ccEndpoint" style="font-weight:600;margin-top:4px;word-break:break-all;">-</div>
+              <div>
+                <div style="opacity:0.7;margin-bottom:4px;">판정 이유</div>
+                <div id="ccReason" style="font-weight:600;">-</div>
               </div>
             </div>
           </div>
 
           <div class="ccSection">
-            <div class="ccSectionTitle">📋 실시간 로그</div>
+            <div class="ccSectionTitle">
+              <span>📋 실시간 로그</span>
+              <button class="ccBtn" id="ccClearLog" style="font-size:0.75em;padding:4px 8px;">지우기</button>
+            </div>
             <div id="ccLogs">로그 대기 중...</div>
           </div>
         </div>
 
         <footer>
-          <button class="ccBtn danger" id="ccResetBtn" type="button">리셋</button>
-          <button class="ccBtn" id="ccTestBtn" type="button">테스트</button>
-          <button class="ccBtn" id="ccCloseBtn2" type="button">닫기</button>
+          <button class="ccBtn danger" id="ccResetBtn">전체 리셋</button>
+          <button class="ccBtn primary" id="ccScanBtn">🔍 스캔</button>
+          <button class="ccBtn" id="ccCloseBtn2">닫기</button>
         </footer>
       </div>
     `;
@@ -381,8 +374,13 @@
     document.getElementById("ccCloseBtn").addEventListener("click", closeDashboard);
     document.getElementById("ccCloseBtn2").addEventListener("click", closeDashboard);
     
-    document.getElementById("ccTestBtn").addEventListener("click", () => {
-      addLog("🧪 수동 테스트 시작");
+    document.getElementById("ccClearLog").addEventListener("click", () => {
+      logs.length = 0;
+      addLog("🗑️ 로그 지움");
+    });
+    
+    document.getElementById("ccScanBtn").addEventListener("click", () => {
+      addLog("🔄 수동 스캔 시작");
       tagGenerationStart();
       renderDashboard();
     });
@@ -428,26 +426,26 @@
     keys.forEach((k, idx) => {
       const v = vals[idx];
       const pct = Math.round((v / max) * 100);
-      const row = document.createElement("div");
-      row.className = "ccBarRow";
-      row.innerHTML = `
-        <div class="ccBarDate">${k.slice(5)}</div>
-        <div class="ccBarTrack"><div class="ccBarFill" style="width:${pct}%"></div></div>
-        <div class="ccBarNum">${v}</div>
+      list.innerHTML += `
+        <div class="ccBarRow">
+          <div class="ccBarDate">${k.slice(5)}</div>
+          <div class="ccBarTrack"><div class="ccBarFill" style="width:${pct}%"></div></div>
+          <div class="ccBarNum">${v}</div>
+        </div>
       `;
-      list.appendChild(row);
     });
 
     document.getElementById("ccBarsHint").textContent = `max ${max}`;
 
-    // 상태 업데이트
-    const elapsed = lastGen.startedAt ? (Date.now() - lastGen.startedAt) : 0;
-    document.getElementById("ccTag").textContent = lastGen.isCopilot ? "✅ Copilot" : "❌ 아님";
-    document.getElementById("ccElapsed").textContent = elapsed > 0 ? `${Math.floor(elapsed/1000)}초 전` : "-";
-    document.getElementById("ccSrc").textContent = lastGen.src || "-";
+    // 상태
+    const elapsed = lastGen.startedAt ? Math.floor((Date.now() - lastGen.startedAt) / 1000) : 0;
+    document.getElementById("ccGenStatus").textContent = 
+      lastGen.isCopilot ? `✅ Copilot (${elapsed}초 전)` : `❌ 아님 (${elapsed}초 전)`;
+    document.getElementById("ccSrc").textContent = lastGen.source || "-";
     document.getElementById("ccEndpoint").textContent = lastGen.endpoint || "-";
+    document.getElementById("ccReason").textContent = lastGen.reason || "-";
 
-    // 로그 업데이트
+    // 로그
     const logEl = document.getElementById("ccLogs");
     if (logEl && logs.length > 0) {
       logEl.innerHTML = logs.map(l => `<div>${l}</div>`).join('');
@@ -455,50 +453,32 @@
   }
 
   // =========================
-  // 6) 메뉴
+  // 메뉴
   // =========================
   function findWandMenuContainer() {
-    const candidates = [
-      "#extensions_menu",
-      "#extensionsMenu",
-      ".extensions_menu"
-    ];
-    for (const sel of candidates) {
-      const el = document.querySelector(sel);
-      if (el) return el;
-    }
-    return null;
+    return document.querySelector("#extensions_menu") || 
+           document.querySelector("#extensionsMenu") ||
+           document.querySelector(".extensions_menu");
   }
 
   function injectWandMenuItem() {
     const menu = findWandMenuContainer();
-    if (!menu) return false;
-    if (menu.querySelector(`#${MENU_ITEM_ID}`)) return true;
+    if (!menu || menu.querySelector(`#${MENU_ITEM_ID}`)) return;
 
     const item = document.createElement("div");
     item.id = MENU_ITEM_ID;
-    item.style.cssText = `
-      padding: 10px 12px;
-      cursor: pointer;
-      user-select: none;
-      border-radius: 10px;
-      margin: 4px 6px;
-      border: 1px solid rgba(255,255,255,.10);
-      background: rgba(255,255,255,.04);
-    `;
+    item.style.cssText = `padding:10px 12px;cursor:pointer;user-select:none;border-radius:10px;margin:4px 6px;border:1px solid rgba(255,255,255,.10);background:rgba(255,255,255,.04);`;
     item.textContent = "🤖 Copilot Counter";
     item.addEventListener("click", (e) => { e.stopPropagation(); openDashboard(); });
     menu.appendChild(item);
-    return true;
   }
 
   function observeForMenu() {
-    const mo = new MutationObserver(() => injectWandMenuItem());
-    mo.observe(document.body, { childList: true, subtree: true });
+    new MutationObserver(() => injectWandMenuItem()).observe(document.body, { childList: true, subtree: true });
   }
 
   // =========================
-  // 7) 집계
+  // 집계
   // =========================
   function increment() {
     const s = getSettings();
@@ -513,51 +493,35 @@
   }
 
   function tryCountFromLastAssistant(eventName) {
-    addLog(`📨 이벤트: ${eventName}`);
+    addLog(`📨 ${eventName}`);
     
+    if (!isThisGenCopilot()) {
+      addLog(`❌ Copilot gen 아님`);
+      return;
+    }
+
     const c = getCtx();
-    const chat = c.chat ?? [];
-    const msg = lastAssistant(chat);
-    
+    const msg = lastAssistant(c.chat ?? []);
     if (!msg) {
       addLog("❌ 어시스턴트 메시지 없음");
       return;
     }
-
-    if (!isThisGenCopilot()) {
-      addLog(`❌ Copilot generation 아님 (${lastGen.reason})`);
-      return;
-    }
-
-    const isAssistant =
-      (msg?.is_user === false) ||
-      (msg?.role === "assistant") ||
-      (msg?.sender === "assistant");
-    if (!isAssistant) {
-      addLog("❌ 사용자 메시지");
-      return;
-    }
     
     if (isErrorLike(msg)) {
-      addLog("❌ 에러 메시지");
+      addLog("❌ 에러");
       return;
     }
 
     const text = getMsgText(msg);
-    if (text.trim().length === 0) {
+    if (!text.trim()) {
       addLog("❌ 빈 메시지");
       return;
     }
 
     const s = getSettings();
     const sig = signatureFromMessage(msg);
-    if (!sig || sig === "none|") {
-      addLog("❌ 잘못된 시그니처");
-      return;
-    }
-    
     if (s.lastSig === sig) {
-      addLog("❌ 중복 메시지");
+      addLog("❌ 중복");
       return;
     }
 
@@ -565,24 +529,16 @@
     increment();
   }
 
-  function onGenStarted(_payload) {
+  function onGenStarted() {
     addLog("🚀 Generation 시작");
     tagGenerationStart();
     const overlay = document.getElementById(OVERLAY_ID);
     if (overlay?.getAttribute("data-open") === "1") renderDashboard();
   }
 
-  function onGenEnded(_payload) {
-    tryCountFromLastAssistant("GEN_END");
-  }
-
-  function onCharacterRendered() {
-    tryCountFromLastAssistant("CHAR_RENDER");
-  }
-
-  function onMessageReceived() {
-    tryCountFromLastAssistant("MSG_RECV");
-  }
+  function onGenEnded() { tryCountFromLastAssistant("GEN_END"); }
+  function onCharacterRendered() { tryCountFromLastAssistant("CHAR_RENDER"); }
+  function onMessageReceived() { tryCountFromLastAssistant("MSG_RECV"); }
 
   function main() {
     addLog("🚀 Copilot Counter 시작");
@@ -595,22 +551,22 @@
 
     if (event_types?.GENERATION_STARTED) {
       eventSource.on(event_types.GENERATION_STARTED, onGenStarted);
-      addLog("✓ GENERATION_STARTED 등록");
+      addLog("✓ GENERATION_STARTED");
     }
     if (event_types?.GENERATION_ENDED) {
       eventSource.on(event_types.GENERATION_ENDED, onGenEnded);
-      addLog("✓ GENERATION_ENDED 등록");
+      addLog("✓ GENERATION_ENDED");
     }
     if (event_types?.CHARACTER_MESSAGE_RENDERED) {
       eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, onCharacterRendered);
-      addLog("✓ CHARACTER_MESSAGE_RENDERED 등록");
+      addLog("✓ CHARACTER_MESSAGE_RENDERED");
     }
     if (event_types?.MESSAGE_RECEIVED) {
       eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
-      addLog("✓ MESSAGE_RECEIVED 등록");
+      addLog("✓ MESSAGE_RECEIVED");
     }
 
-    addLog("✅ 초기화 완료!");
+    addLog("✅ 초기화 완료");
   }
 
   main();
