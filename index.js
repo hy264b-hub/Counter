@@ -117,15 +117,25 @@
     addLog("🔍 Copilot 분석 시작...");
     
     let copilotEndpoint = null;
+    let googleEndpoint = null;
     let apiSource = null;
 
-    // 4141 포트 찾기
+    // 엔드포인트 찾기
     for (const f of findings) {
       const val = f.value.toLowerCase();
+      
+      // Google API 엔드포인트 감지
+      if (val.includes("generativelanguage.googleapis.com") || 
+          val.includes("ai.google.dev") ||
+          val.includes("aistudio.google.com")) {
+        googleEndpoint = f;
+        addLog(`🌐 Google API 엔드포인트 발견: ${f.path}`);
+      }
+      
+      // 4141 포트 감지
       if (val.includes(":4141") || val.includes("localhost:4141") || val.includes("127.0.0.1:4141")) {
         copilotEndpoint = f;
-        addLog(`✅ 4141 엔드포인트 발견: ${f.path}`);
-        break;
+        addLog(`🔌 4141 엔드포인트 발견: ${f.path}`);
       }
     }
 
@@ -146,10 +156,34 @@
       }
     }
 
-    // ✅ 판정: 엔드포인트가 4141이면 무조건 Copilot (소스 이름 무시)
+    // ✅ 판정 로직
+    const sourceVal = apiSource?.value.toLowerCase() || "";
+    
+    // 1순위: Google 엔드포인트가 있으면 무조건 Google (4141이 있어도)
+    if (googleEndpoint) {
+      addLog(`❌ Google API 직접 접속 감지 - Copilot 아님`);
+      return { 
+        isCopilot: false, 
+        reason: "google-direct-api", 
+        endpoint: googleEndpoint.value, 
+        source: sourceVal 
+      };
+    }
+    
+    // 2순위: 소스가 "google" 또는 "gemini"이고 4141이 없으면 Google
+    if ((sourceVal.includes("google") || sourceVal.includes("gemini")) && !copilotEndpoint) {
+      addLog(`❌ Google AI Studio (4141 없음) - Copilot 아님`);
+      return { 
+        isCopilot: false, 
+        reason: "google-no-4141", 
+        endpoint: "", 
+        source: sourceVal 
+      };
+    }
+    
+    // 3순위: 4141 엔드포인트가 있으면 Copilot
     if (copilotEndpoint) {
-      const sourceVal = apiSource?.value || "";
-      addLog(`✅ Copilot 확정! (엔드포인트 4141 감지)`);
+      addLog(`✅ Copilot 확정! (4141 포트 감지)`);
       addLog(`  └ 소스: ${sourceVal || "없음"} (Copilot을 통해 접속)`);
       return { 
         isCopilot: true, 
@@ -159,8 +193,13 @@
       };
     }
 
-    addLog("❌ 4141 엔드포인트 없음 - Copilot 아님");
-    return { isCopilot: false, reason: "no-4141", endpoint: "", source: apiSource?.value || "" };
+    addLog("❌ Copilot 흔적 없음");
+    return { 
+      isCopilot: false, 
+      reason: "no-copilot-indicators", 
+      endpoint: "", 
+      source: sourceVal 
+    };
   }
 
   // =========================
